@@ -46,7 +46,7 @@ th{color:#7d8590;font-weight:500;font-size:12px}
 .tag{display:inline-block;padding:0 6px;border-radius:6px;background:#21262d;color:#8b949e;font-size:11px}
 pre{white-space:pre-wrap;word-break:break-word;margin:0;color:#c9d1d9;font-size:12px;max-height:90px;overflow:auto}
 .bars{display:flex;align-items:flex-end;gap:6px;height:56px;margin:4px 0 18px}
-.bar{flex:1;background:#1f6feb;border-radius:3px 3px 0 0;min-height:2px;position:relative}
+.bar{flex:1;max-width:56px;background:#1f6feb;border-radius:3px 3px 0 0;min-height:2px;position:relative}
 .bar i{position:absolute;bottom:-16px;left:0;right:0;text-align:center;font-size:10px;color:#7d8590;font-style:normal}
 </style></head><body><div class="wrap">
 <h1>QQ Agent 控制台 <span class="tag" id="panel"></span></h1>
@@ -82,7 +82,7 @@ async function load(){
       ['时延 p50', ms(st.p50_ms)],
       ['时延 p95', ms(st.p95_ms)],
       ['token 入/出', ((st.tokens_in ?? 0)/1000).toFixed(0) + 'k / ' + ((st.tokens_out ?? 0)/1000).toFixed(0) + 'k'],
-      ['累计花费', '$' + (st.cost ?? 0).toFixed(3)],
+      ['累计花费(估)', '$' + (st.cost ?? 0).toFixed(2)],
       ['在线', (st.uptime_hours ?? 0).toFixed(1) + 'h'],
       ['worker', st.workers ?? 1],
       ['工作目录', st.cwd || ''],

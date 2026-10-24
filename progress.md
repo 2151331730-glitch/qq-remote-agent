@@ -136,3 +136,42 @@
 3. **统一入口的雏形**：QQ 与网页共用同一个队列和同一个 owner 白名单；飞书等其它入口未接（需要应用凭据）。
 其它：新增 restart-bridge.ps1（唯一重启入口，先杀 claude 子进程再杀 bridge，验证进程启动时间晚于文件修改时间）；tools/apply-bridge-restart.py（等本任务结果发完再重启）。
 测试：tests/mock_test6.py 全部通过（危险任务拦截、/取消、/确认后执行、无 token 403、网页提交、审计事件）；mock_test5 回归通过。
+
+### 2026-10-24 18:05-18:12 工程化升级（v2）
+
+目标：把"能用的个人脚本"变成"面试能讲的系统"。三根支柱 + 基建。
+
+**1. 持久化任务队列（store.py）**
+- SQLite WAL；状态机 queued→running→succeeded/failed/cancelled/interrupted
+- `dedup_key=qq:<message_id>` 唯一索引 → 至少一次投递、恰好一次执行
+- 崩溃/重启：启动时 `recover_interrupted()`，把残留 running 标成 interrupted 并主动通知
+- 轻量迁移：老库缺 `tokens_*` 列时自动 ALTER TABLE
+
+**2. 并发与背压**
+- worker pool（`workers`，默认 1）+ 按 cwd 加 asyncio.Lock：同目录串行、不同目录可并行
+- 多 worker 时禁用 `--resume`，避免共享会话互相污染
+- 队列深度 ≥ max_queue 直接拒绝；新增 `/任务`、`/取消 <ID>`
+
+**3. 可观测性**
+- metrics.py：自实现 Prometheus 指标（counter/gauge/histogram，累积桶语义）
+- panel.py：p50/p95、24h 成功率、近 7 天柱状图、`/metrics` 端点、任务表带 token
+- 事件表 events + audit.jsonl 双落盘
+
+**4. 真实 token 计量与成本熔断**
+- 实测发现：`--resume` 会话会让单次输入涨到 205k token（只回三个字）
+- 记录 tokens_in/out（含缓存命中），`cost_usd` 标注为 CLI 估算值
+- `session_token_limit`（默认 120k）：超限自动开新会话；重启时也丢弃超限旧会话
+- 效果：205k → 29k（7 倍），单任务 8.4 秒
+
+**5. 工程基建**
+- git 仓库（3 个提交）+ .gitignore（napcat/、logs/、config.json、db 全部排除）
+- 44 个 pytest 单测（store/guard/metrics/panel，含迁移测试）
+- GitHub Actions CI（Windows，3.11/3.13 矩阵）
+- README（能力表 + 快速开始）、ARCHITECTURE（7 条 ADR + 已知限制）
+
+**踩坑**
+- `git add -A` 把 napcat 整个目录和 webui.json（含 token）提交了 → 删库重建，补 .gitignore
+- 测试里硬编码 token → 抽 `tests/_cfg.py` 统一从 config 读
+- 端点 `/api/tasks` 语义从"审计事件"改成"任务列表"，旧测试要改用 `/api/events`
+- `!` 命令的 PowerShell 输出偶发 GBK 乱码 → 命令前置 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`
+- claude.exe 自更新时偶发 WinError 216 → 起进程失败重试一次
