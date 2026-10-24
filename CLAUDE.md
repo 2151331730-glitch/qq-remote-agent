@@ -42,11 +42,17 @@
 | `restart-bridge.ps1` | **唯一正确的重启入口**：停任务 → 先杀 claude 子进程 → 杀 bridge → 重启任务；日志写 `logs\restart.txt` |
 | `自检.ps1` | 出门前六项体检 + 最近 6 行日志 |
 | `bridge\bridge.py` | 桥本体（asyncio，单客户端，串行队列≤5，超时 45 min，心跳 60 s） |
-| `bridge\store.py` | **任务状态机 + 幂等 + 恢复**（SQLite WAL）：queued→running→succeeded/failed/cancelled/interrupted |
+| `bridge\intent.py` | 闲聊 / 任务分流规则（`classify()`，关键词 + 疑问句 + 路径） |
+| `bridge\reminders.py` | 提醒时间解析 + 独立 `reminders.db`（`/提醒` 系列命令） |
+| `bridge\persona.md` | 人格设定，闲聊与任务共用；改完重启生效 |
+| `bridge\memory.py` | 长期记忆读写（纯文本，一行一条，超 4000 字丢最旧） |
+| `bridge\memory.md` | 长期记忆正文（**私人内容，不入库**；模板见 `memory.example.md`） |
+| `bridge\store.py` | **任务状态机 + 幂等 + 恢复**（SQLite WAL）：queued→running→succeeded/failed/cancelled/interrupted；`kind` 区分 task/chat |
 | `bridge\metrics.py` | 计数/仪表/直方图，输出 Prometheus 文本 |
 | `bridge\guard.py` | 危险词/危险命令识别 → 要求 `/确认`；审计写 `logs\audit.jsonl` |
 | `bridge\panel.py` | 3099 看板 + `/api/*` + `/metrics` |
 | `bridge\tasks.db` | 任务与事件表（**不入库**，运行时生成） |
+| `bridge\reminders.db` | 提醒表（**不入库**，运行时生成） |
 | `bridge\config.example.json` | 配置模板；真正的 `config.json` 含 token，**不入库** |
 | `bridge\config.json` | 机器人号 / 主人号 / WS 地址 / token / claude 路径 / 工作目录 |
 | `bridge\state.json` | `owner_uin` / `session_id` / `cwd` / `current_task` / `cost_total`（原子写） |
@@ -98,6 +104,9 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 ## 任务队列语义（改队列前必读）
 
 - 状态机：`queued → running → succeeded | failed | cancelled | interrupted`，只有 `queued` 能被 `/取消 <ID>`。
+- 通道：`tasks.kind` = `task`（执行语义 + `session_id`）或 `chat`（闲聊 + `chat_session_id`）；
+  分流在 `on_message` 里由 `intent.classify()` 决定，`/执行`、`/聊` 可覆盖；闲聊不转发 🔧、不发心跳、不回 📥。
+- 提醒：`reminders.db` 独立库，`reminder_loop` 每 20 秒扫到点项，走发件箱发送；`sent_at` 标记后不重发。
 - 幂等：`dedup_key = qq:<message_id>` 有唯一索引，重复投递直接丢弃（`store.enqueue` 返回 `dup=True`）。
 - 崩溃恢复：启动时 `recover_interrupted()` 把残留 `running` 标成 `interrupted`，并在连上 QQ 后主动通知。
 - 并发：`workers` 配置默认 1；多个 worker 时按 `cwd` 加 `asyncio.Lock`，同目录串行；**多 worker 会禁用 `--resume`**，避免共享同一会话。

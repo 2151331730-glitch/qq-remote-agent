@@ -29,9 +29,12 @@ from pathlib import Path
 from websockets.asyncio.client import connect
 
 import sandbox
+import memory
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
+from intent import classify
 from metrics import METRICS
 from panel import Panel
+from reminders import ReminderStore, format_when, parse_reminder
 from store import TaskStore
 
 BASE = Path(__file__).resolve().parent
@@ -76,6 +79,19 @@ STREAM_TEXT = bool(CFG.get("stream_text", True))
 STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
 STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
 MODEL = CFG.get("model") or ""
+# 人格设定：闲聊与任务共用（文件不存在时为空，不影响运行）
+PERSONA_PATH = Path(CFG.get("persona_path") or (BASE / "persona.md"))
+# 长期记忆（纯文本，一行一条）：只在闲聊通道注入提示词
+MEMORY_PATH = Path(CFG.get("memory_path") or (BASE / "memory.md"))
+# 两套提示词：闲聊默认原话直发；任务保留执行语义但去掉模板腔
+CHAT_TEMPLATE = str(CFG.get("chat_prompt_template") or "")
+TASK_TEMPLATE = str(CFG.get("task_prompt_template") or CFG.get("prompt_template")
+                    or "（手机 QQ 发来的任务，直接在本机执行）{task}\n"
+                       "做完用纯文本给一句结论，别用 Markdown 标题和表格。")
+# 结果尾部是否附 "⏱ 8.2s · 29k→154 tok"（默认不附，需要时发 /详情）
+SHOW_FOOTER = bool(CFG.get("show_footer", False))
+REMINDER_DB = Path(os.environ.get("QQ_REMOTE_REMINDERS") or (BASE / "reminders.db"))
+REMINDER_INTERVAL = int(CFG.get("reminder_check_seconds", 20))
 # 盯梢：长时间没有任何输出就提示/中止，避免"卡住没人知道"
 STALL_WARN_SEC = int(CFG.get("stall_warn_seconds", 90))
 STALL_KILL_SEC = int(CFG.get("stall_kill_seconds", 300))
@@ -95,9 +111,67 @@ CONFIRM_TTL = 300
 
 START_TS = time.time()
 STATE = {"owner_uin": int(CFG.get("owner_uin", 0) or 0), "session_id": "", "cwd": WORKDIR,
-         "current_task": "", "last_tokens_in": 0}
+         "current_task": "", "last_tokens_in": 0,
+         # 闲聊通道独立会话：任务里的长篇上下文不会污染日常聊天，也不会互相顶掉 token 预算
+         "chat_session_id": "", "chat_last_tokens_in": 0,
+         # 上一次任务的结果概要，供 /详情 查看（持久化，重启后也还在）
+         "last_task": {}}
 COST_TOTAL = 0.0
 LAST_RESULT = ""
+# 提醒（独立 SQLite，和队列后端无关）
+RSTORE = ReminderStore(REMINDER_DB)
+
+
+def _load_persona() -> str:
+    try:
+        if PERSONA_PATH.exists():
+            return PERSONA_PATH.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning("persona load failed: %s", e)
+    return ""
+
+
+PERSONA = _load_persona()
+
+
+def session_key(kind: str) -> str:
+    return "chat_session_id" if kind == "chat" else "session_id"
+
+
+def tokens_key(kind: str) -> str:
+    return "chat_last_tokens_in" if kind == "chat" else "last_tokens_in"
+
+
+def get_session(kind: str) -> str:
+    return STATE.get(session_key(kind)) or ""
+
+
+def build_prompt(kind: str, text: str) -> str:
+    """按通道套提示词。用 replace 不用 format：人格文本里出现花括号也不会炸。
+
+    闲聊通道会额外注入长期记忆（bridge/memory.md），任务通道不注入——
+    任务要的是指令清晰，记忆里那些"爱吃辣"之类会分散注意力。
+    """
+    tpl = CHAT_TEMPLATE if kind == "chat" else TASK_TEMPLATE
+    core = tpl.replace("{task}", text) if tpl else text
+    persona_in_core = "{persona}" in core
+    if persona_in_core:
+        core = core.replace("{persona}", PERSONA)
+    if kind != "chat":
+        return core
+
+    parts = []
+    if PERSONA and not persona_in_core:
+        parts.append(PERSONA)
+    mem = memory.load(MEMORY_PATH) if MEMORY_PATH else ""
+    if mem:
+        block = ("（你记得的关于主人的事，需要时自然用上，不要逐条复述：\n"
+                 + mem + "）")
+        if persona_in_core:
+            return core + "\n\n" + block
+        parts.append(block)
+    parts.append(core)
+    return "\n\n".join(parts)
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
 STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
 if STORE_BACKEND == "redis":
@@ -292,7 +366,8 @@ def _describe_tool(block) -> str:
     return f"{name}: {detail}" if detail else str(name)
 
 
-def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: bool):
+def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: bool,
+                    session: str = ""):
     """把 agent 命令包进 WSL 执行。
 
     三个坑（都实测踩过）：
@@ -318,8 +393,8 @@ def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: b
     cmd += " --dangerously-skip-permissions"
     if cwd:
         cmd += " --add-dir " + shlex.quote(sandbox._win_to_wsl(cwd))
-    if use_resume and STATE.get("session_id"):
-        cmd += " --resume " + shlex.quote(STATE["session_id"])
+    if use_resume and session:
+        cmd += " --resume " + shlex.quote(session)
 
     # `~` 放在双引号里不会展开，统一换成 $HOME
     _exp = lambda s: s.replace("~", "$HOME", 1) if s.startswith("~") else s  # noqa: E731
@@ -355,9 +430,11 @@ def check_agent_sandbox() -> bool:
     return ok
 
 
-async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_text=None):
+async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_text=None,
+                     kind: str = "task"):
     """跑一次 claude -p。
 
+    kind 决定续接哪个会话（task / chat），两条通道互不影响。
     返回 (成功?, 文本, CLI 估算成本, 退出码, 输入 token, 输出 token, 错误类型)。
     错误类型：ok / timeout / parse / cli_error / spawn
     注意 cost_usd 是 CLI 按 Claude 价目表估的值，DeepSeek 侧实际计费不同。
@@ -365,13 +442,15 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
     global COST_TOTAL, LAST_RESULT
     # 多 worker 并发时不许共用同一个 --resume 会话，否则上下文会互相污染
     use_session = WORKERS == 1
+    session = get_session(kind)
 
     async def _once(use_resume: bool):
         # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
         base = list(CFG.get("claude_cmd") or [CLAUDE])
         fmt = "stream-json" if STREAM_PROGRESS else "json"
         if AGENT_SANDBOX == "wsl":
-            args = _wsl_agent_argv(prompt, cwd, fmt, task_id, use_resume and use_session)
+            args = _wsl_agent_argv(prompt, cwd, fmt, task_id, use_resume and use_session,
+                                   session if use_session else "")
         else:
             args = base + ["-p", prompt, "--output-format", fmt,
                            "--dangerously-skip-permissions"]
@@ -381,8 +460,8 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                     args.append("--include-partial-messages")
             if MODEL:
                 args += ["--model", MODEL]
-            if use_resume and use_session and STATE.get("session_id"):
-                args += ["--resume", STATE["session_id"]]
+            if use_resume and use_session and session:
+                args += ["--resume", session]
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", WSL_UTF8="1")
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -492,18 +571,18 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                 continue
         return None
 
-    resumed = bool(STATE.get("session_id")) and use_session
-    lines, err, code, kind = await _once(resumed)
+    resumed = bool(session) and use_session
+    lines, err, code, kind_err = await _once(resumed)
     if lines is None:
-        return False, err, 0.0, code, 0, 0, kind or "spawn"
+        return False, err, 0.0, code, 0, 0, kind_err or "spawn"
 
     data = _parse(lines)
     tail = "\n".join(lines[-8:])
     if data is None and resumed and _session_invalid(err or tail):
         log("resume 失败（旧会话不存在），改用新会话重试")
-        lines, err, code, kind = await _once(False)
+        lines, err, code, kind_err = await _once(False)
         if lines is None:
-            return False, err, 0.0, code, 0, 0, kind or "spawn"
+            return False, err, 0.0, code, 0, 0, kind_err or "spawn"
         data = _parse(lines)
         tail = "\n".join(lines[-8:])
     if data is None:
@@ -512,7 +591,7 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
 
     sid = data.get("session_id")
     if sid and use_session:
-        STATE["session_id"] = sid
+        STATE[session_key(kind)] = sid
         save_state()
 
     cost = float(data.get("total_cost_usd") or 0)
@@ -571,13 +650,15 @@ async def worker(wid: int):
 async def _execute(row, cwd):
     tid = row["id"]
     text = row["text"]
+    kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
     started = time.time()
-    prompt = CFG.get("prompt_template", "【来自 QQ 的远程任务】{task}").format(task=text)
+    prompt = build_prompt(kind, text)
     STATE["current_task"] = text
     save_state()
     sync_gauges()
-    audit(AUDIT_PATH, event="task_start", id=tid, source=row["source"], text=text[:500])
-    log(f"任务开始 [{tid}]：{text[:200]}")
+    audit(AUDIT_PATH, event="task_start", id=tid, source=row["source"], kind=kind,
+          text=text[:500])
+    log(f"{'闲聊' if kind == 'chat' else '任务'}开始 [{tid}]：{text[:200]}")
 
     async def _progress(msg):
         # 进度也进发件箱：断线时不丢
@@ -589,13 +670,18 @@ async def _execute(row, cwd):
         if txt:
             await deliver(txt, tid)
 
-    run_task = asyncio.create_task(
-        run_claude(prompt, tid, cwd, on_progress=_progress, on_text=_text))
-    RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd}
-    hb = asyncio.create_task(heartbeat(tid, started))
-    cost, tin, tout, kind = 0.0, 0, 0, "ok"
+    run_task = asyncio.create_task(run_claude(
+        prompt, tid, cwd,
+        # 闲聊不转发工具进度：手机聊天里不该出现运维日志
+        on_progress=None if kind == "chat" else _progress,
+        on_text=_text, kind=kind))
+    RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd,
+                    "kind": kind}
+    # 闲聊要快，不发"还在执行"心跳
+    hb = asyncio.create_task(heartbeat(tid, started)) if kind != "chat" else None
+    cost, tin, tout, err_kind = 0.0, 0, 0, "ok"
     try:
-        ok, reply, cost, code, tin, tout, kind = await run_task
+        ok, reply, cost, code, tin, tout, err_kind = await run_task
     except asyncio.CancelledError:
         if not run_task.cancelled():
             raise
@@ -607,35 +693,51 @@ async def _execute(row, cwd):
         return
     except Exception as e:
         logger.exception("task exception")
-        ok, reply, cost, code, tin, tout, kind = False, f"❌ 执行异常：{e}", 0.0, -1, 0, 0, "exception"
+        ok, reply, cost, code, tin, tout, err_kind = False, f"❌ 执行异常：{e}", 0.0, -1, 0, 0, "exception"
     finally:
-        hb.cancel()
+        if hb:
+            hb.cancel()
 
     seconds = time.time() - started
     state = "succeeded" if ok else "failed"
     STORE.finish(tid, state, result=reply, error=None if ok else reply,
                  exit_code=code, cost_usd=cost, duration_ms=int(seconds * 1000),
-                 tokens_in=tin, tokens_out=tout, error_kind=None if ok else kind)
+                 tokens_in=tin, tokens_out=tout, error_kind=None if ok else err_kind)
     METRICS.inc("qq_remote_tasks_total", {"state": state})
     if not ok:
-        METRICS.inc("qq_remote_task_errors_total", {"kind": kind})
+        METRICS.inc("qq_remote_task_errors_total", {"kind": err_kind})
     METRICS.observe("qq_remote_task_duration_seconds", seconds)
     METRICS.inc("qq_remote_cost_usd_total", {}, cost)
     METRICS.inc("qq_remote_tokens_total", {"direction": "in"}, tin)
     METRICS.inc("qq_remote_tokens_total", {"direction": "out"}, tout)
-    audit(AUDIT_PATH, event="task_end", id=tid, source=row["source"], ok=ok,
+    audit(AUDIT_PATH, event="task_end", id=tid, source=row["source"], ok=ok, kind=kind,
           seconds=round(seconds, 1), cost_usd=round(cost, 6),
           tokens_in=tin, tokens_out=tout, result=(reply or "")[:2000])
-    STATE["last_tokens_in"] = tin
-    log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s tokens={tin}+{tout}")
-    footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok"
-    await deliver(("✅ " if ok else "⚠️ ") + _plain(reply) + footer, tid)
-    if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
-        STATE["session_id"] = ""
+    STATE[tokens_key(kind)] = tin
+    if kind == "task":
+        STATE["last_task"] = {
+            "id": tid, "ok": bool(ok), "at": time.time(), "seconds": round(seconds, 1),
+            "tokens_in": tin, "tokens_out": tout, "cost_usd": round(cost, 6),
+            "error_kind": None if ok else err_kind, "cwd": cwd, "text": text[:120]}
+    log(f"任务结束 [{tid}]：{kind} success={ok} 用时 {seconds:.0f}s tokens={tin}+{tout}")
+
+    body = _plain(reply)
+    if kind == "chat":
+        # 闲聊：不要 ✅ 前缀、不要 ⏱ 尾巴，直接说话
+        await deliver(body or "（没有回话）", tid)
+    else:
+        footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok" if SHOW_FOOTER else ""
+        await deliver(("✅ " if ok else "⚠️ ") + body + footer, tid)
+    if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and get_session(kind):
+        STATE[session_key(kind)] = ""
+        STATE[tokens_key(kind)] = 0
         save_state()
-        log(f"上下文自动重置：本次输入 {tin} token 超过上限 {SESSION_TOKEN_LIMIT}")
-        await deliver(f"🧹 本次任务读了 {tin / 1000:.0f}k token，已自动开新会话省成本。"
-                   f"需要接着上文的话，先发 /新会话 前的任务里说明背景。")
+        log(f"上下文自动重置（{kind}）：本次输入 {tin} token 超过上限 {SESSION_TOKEN_LIMIT}")
+        if kind == "chat":
+            await deliver("（聊得有点长了，我换了个新记忆继续；要紧的事再说一遍就好）", tid)
+        else:
+            await deliver(f"🧹 本次任务读了 {tin / 1000:.0f}k token，已自动开新会话省成本。"
+                          f"需要接着上文的话，先发 /新会话 前的任务里说明背景。")
     _cleanup(tid)
 
 
@@ -653,26 +755,53 @@ async def heartbeat(tid, started):
         await deliver(f"⏳ 还在执行（已 {mins:.0f} 分钟）…", tid)
 
 
+async def reminder_loop():
+    """每 REMINDER_INTERVAL 秒扫一次到点的提醒。
+
+    发送同样走发件箱：到点时如果 NapCat 断线，消息会落在库里，重连后补发。
+    标记已发是防止同一条提醒反复推送（补发由发件箱负责）。
+    """
+    await asyncio.sleep(5)   # 启动瞬间先别抢连接
+    while True:
+        try:
+            for r in RSTORE.due():
+                ok = await deliver(f"⏰ {r['text']}")
+                RSTORE.mark_sent(r["id"])
+                log(f"提醒 #{r['id']} 发出（{'成功' if ok else '进发件箱待补发'}）：{r['text'][:60]}")
+            RSTORE.prune(90)
+        except Exception:
+            logger.exception("reminder loop error")
+        await asyncio.sleep(REMINDER_INTERVAL)
+
+
 # ---------------- 命令 ----------------
 
 HELP = """命令：
 /状态 看运行状态（含 p95 时延、成功率）
 /任务 [n] 最近任务列表（带 ID）
+/详情 上次任务花了多久、多少 token
 /停止 中断当前任务
 /取消 <ID> 取消排队中的任务
 /清空 清空排队中的任务
 /确认 执行待确认的危险操作
 /取消 放弃待确认的操作（/取消 <ID> = 取消排队中的某条）
-/新会话 清空对话上下文
+/新会话 清空对话上下文（闲聊和任务都清）
+/记住 <内容> 记进长期记忆（例：/记住 周三下午有课）
+/记忆 看长期记忆里记了什么
+/提醒 20:30 交作业 到点提醒（也支持 明天 8:00 / 10-25 20:30 / +10m）
+/提醒列表 看还没到点的提醒
+/取消提醒 <ID> 取消一条提醒
 /日志 [n] 看最近日志
 /全文 看上次完整结果
 /cd <路径> 换工作目录
 /心跳 测试是否在线
 /model <名称> 切换模型（default 恢复）
 /cost 看 token 与花费
+/聊 <内容> 强制当成闲聊（不执行）
+/执行 <内容> 强制当成任务（去做）
 !<命令> 直接执行 PowerShell（例：!dir C:\\）
 !!<命令> 在沙箱里执行（WSL/Docker，隔离但只挂载当前目录）
-其他任何文字 = 交给 claude 干活
+其他任何文字 = 自动判断闲聊或任务
 （危险任务会先要求 /确认；本机看板 http://127.0.0.1:3099/）"""
 
 
@@ -710,8 +839,80 @@ async def handle_command(text: str) -> bool:
             f"token 累计 入 {st['tokens_in'] / 1000:.0f}k / 出 {st['tokens_out'] / 1000:.0f}k\n"
             f"24h 花费 ${st['window_cost']:.3f}（估算）· 累计 ${st['total_cost']:.3f}\n"
             f"工作目录：{STATE.get('cwd')}\n"
-            f"会话：{(STATE.get('session_id') or '无')[:8]}  worker：{WORKERS}"
+            f"会话：任务 {(STATE.get('session_id') or '无')[:8]}"
+            f" / 闲聊 {(STATE.get('chat_session_id') or '无')[:8]}  worker：{WORKERS}"
         )
+        return True
+
+    if low in ("/详情", "/last", "/info"):
+        m = STATE.get("last_task") or {}
+        if not m:
+            await send("还没有任务记录。")
+        else:
+            when = time.strftime("%m-%d %H:%M", time.localtime(m.get("at") or 0))
+            state = "成功" if m.get("ok") else f"失败（{m.get('error_kind') or '未知'}）"
+            await send(f"上次任务 {m.get('id')}（{when}）\n"
+                       f"{state} · 用时 {m.get('seconds')}s\n"
+                       f"输入 {m.get('tokens_in')} · 输出 {m.get('tokens_out')} tok\n"
+                       f"估算花费 ${m.get('cost_usd') or 0:.4f}\n"
+                       f"目录 {m.get('cwd')}\n"
+                       f"内容 {m.get('text')}")
+        return True
+
+    if low in ("/记忆", "/memory"):
+        mem = memory.load(MEMORY_PATH)
+        if mem:
+            await send("🧠 我还记得这些：\n" + mem)
+        else:
+            await send("还没有特别的记忆。发 /记住 <内容> 添加。")
+        return True
+
+    if low.startswith("/记住 ") or low.startswith("/remember "):
+        content = t.split(maxsplit=1)[1].strip()
+        try:
+            memory.append(MEMORY_PATH, content)
+        except ValueError as e:
+            await send(f"⚠️ {e}")
+            return True
+        log(f"新增记忆：{content[:80]}")
+        await send(f"🧠 记住了：{content}")
+        return True
+
+    if low in ("/提醒列表", "/提醒", "/reminders", "/reminder"):
+        rows = RSTORE.pending()
+        if not rows:
+            await send("没有待提醒的事。用法：/提醒 20:30 交作业")
+        else:
+            now = time.time()
+            lines = [f"#{r['id']} {format_when(r['fire_at'], now)} {r['text']}" for r in rows]
+            await send("待提醒：\n" + "\n".join(lines) + "\n取消：/取消提醒 <ID>")
+        return True
+
+    if low.startswith("/提醒 "):
+        raw = t.split(maxsplit=1)[1].strip()
+        try:
+            fire_at, body = parse_reminder(raw)
+        except ValueError as e:
+            await send(f"⚠️ {e}")
+            return True
+        rid = RSTORE.add(body, fire_at)
+        log(f"新增提醒 #{rid}：{time.strftime('%Y-%m-%d %H:%M', time.localtime(fire_at))} {body}")
+        await send(f"⏰ 好的，{format_when(fire_at)}提醒你：{body}（#{rid}）")
+        return True
+
+    if low.startswith("/取消提醒") or low.startswith("/remind-cancel"):
+        parts = t.split()
+        if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
+            await send("用法：/取消提醒 <ID>（ID 在 /提醒列表 里看）")
+            return True
+        rid = int(parts[1].lstrip("#"))
+        row = RSTORE.get(rid)
+        if not row:
+            await send(f"没有编号 {rid} 的提醒。")
+        elif RSTORE.cancel(rid):
+            await send(f"🗑 已取消提醒 #{rid}：{row['text']}")
+        else:
+            await send(f"#{rid} 已经发过或取消过了。")
         return True
 
     if low.startswith("/任务") or low.startswith("/tasks"):
@@ -785,8 +986,9 @@ async def handle_command(text: str) -> bool:
 
     if low in ("/新会话", "/new"):
         STATE["session_id"] = ""
+        STATE["chat_session_id"] = ""
         save_state()
-        await send("🧹 已开新会话。")
+        await send("🧹 已开新会话（闲聊和任务都清空了）。")
         return True
 
     if low in ("/心跳", "/ping"):
@@ -868,8 +1070,13 @@ async def _ask_confirm(kind, text, source, reason):
     return {"status": "confirm", "reason": reason}
 
 
-async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender=None, cwd=None):
-    """入队一个 agent 任务；危险任务先要求确认。cwd 指定后可按目录并行。"""
+async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender=None,
+                      cwd=None, kind="task"):
+    """入队一个 agent 任务；危险任务先要求确认。cwd 指定后可按目录并行。
+
+    kind="chat" 是闲聊通道：同样的执行器，但用闲聊提示词与会话，回复不带任务后缀。
+    闲聊里如果出现危险操作，直接升级成任务并走 /确认，不因为"听起来像聊天"就放行。
+    """
     text = (text or "").strip()
     if not text:
         return {"status": "rejected", "error": "empty"}
@@ -884,13 +1091,13 @@ async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender
     if reason and not confirmed:
         return await _ask_confirm("task", text, source, reason)
     tid, dup = STORE.enqueue(text, source=source, sender=sender, dedup_key=dedup_key,
-                             cwd=cwd or STATE.get("cwd") or WORKDIR)
+                             cwd=cwd or STATE.get("cwd") or WORKDIR, kind=kind)
     if dup:
         log(f"重复投递，忽略：{dedup_key} -> {tid}")
         return {"status": "duplicate", "id": tid}
     WAKE.set()
     sync_gauges()
-    return {"status": "queued", "id": tid, "pos": STORE.queue_depth()}
+    return {"status": "queued", "id": tid, "pos": STORE.queue_depth(), "kind": kind}
 
 
 async def submit_shell(text, source="qq", confirmed=False):
@@ -1036,12 +1243,33 @@ async def on_message(data):
     if await handle_command(text):
         return
 
+    # 显式指定通道：/执行 强制当任务，/聊 强制当闲聊
+    force = None
+    low = text.lower()
+    if low.startswith("/执行 ") or low.startswith("/do ") or low.startswith("/task "):
+        text = text.split(maxsplit=1)[1].strip()
+        force = "task"
+    elif low.startswith("/聊 ") or low.startswith("/chat "):
+        text = text.split(maxsplit=1)[1].strip()
+        force = "chat"
+    if not text:
+        await send("用法：/执行 <要做的事> 或 /聊 <想说的话>")
+        return
+    if force:
+        kind, why = force, "用户指定"
+    else:
+        kind, why = classify(text, has_images=bool(imgs))
+    log(f"分流：{kind}（{why}）")
+
     # message_id 做幂等键：NapCat 重连后可能重投同一条消息
     mid = data.get("message_id")
     dedup = f"qq:{mid}" if mid is not None else None
-    res = await submit_task(text, "qq", dedup_key=dedup, sender=str(uid))
+    res = await submit_task(text, "qq", dedup_key=dedup, sender=str(uid), kind=kind)
     status = res.get("status")
     if status == "queued":
+        if kind == "chat":
+            # 闲聊不确认、不排队提示，直接等回答（像发微信）
+            return
         if res["pos"] > 1:
             await send(f"📥 已收到，排在第 {res['pos']} 位。（任务 {res['id']}）")
         else:
@@ -1213,15 +1441,23 @@ async def main():
     rows = STORE.recover_interrupted()
     PENDING_NOTICES = [f"{r['id']} {r['text'][:60]}" for r in rows]
     STATE["current_task"] = ""
-    # 上次会话已经很贵了就别继续接力，直接开新的
-    if STATE.get("last_tokens_in", 0) > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
-        log(f"启动时放弃旧会话（上次输入 {STATE['last_tokens_in']} token 超限）")
-        STATE["session_id"] = ""
-        STATE["last_tokens_in"] = 0
+    # 上次会话已经很贵了就别继续接力，直接开新的（闲聊/任务各算各的）
+    for _kind in ("task", "chat"):
+        if STATE.get(tokens_key(_kind), 0) > SESSION_TOKEN_LIMIT and STATE.get(session_key(_kind)):
+            log(f"启动时放弃旧会话（{_kind}，上次输入 {STATE[tokens_key(_kind)]} token 超限）")
+            STATE[session_key(_kind)] = ""
+            STATE[tokens_key(_kind)] = 0
     save_state()
     for i in range(WORKERS):
         asyncio.create_task(worker(i))
     asyncio.create_task(janitor())
+    asyncio.create_task(reminder_loop())
+    try:
+        _pending_reminders = len(RSTORE.pending())
+        if _pending_reminders:
+            log(f"待提醒 {_pending_reminders} 条")
+    except Exception:
+        pass
     panel = Panel(PANEL_PORT, PANEL_TOKEN, asyncio.get_running_loop(),
                   state_fn=panel_state, tasks_fn=panel_tasks, submit_coro=submit_task,
                   events_fn=panel_events, metrics_fn=panel_metrics)

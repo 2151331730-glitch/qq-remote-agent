@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     state       TEXT NOT NULL,
     priority    INTEGER NOT NULL DEFAULT 0,
     cwd         TEXT,
+    kind        TEXT NOT NULL DEFAULT 'task',
     attempts    INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL,
     started_at  REAL,
@@ -88,7 +89,8 @@ class TaskStore:
         cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
         for name, ddl in (("tokens_in", "ALTER TABLE tasks ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"),
                           ("tokens_out", "ALTER TABLE tasks ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0"),
-                          ("error_kind", "ALTER TABLE tasks ADD COLUMN error_kind TEXT")):
+                          ("error_kind", "ALTER TABLE tasks ADD COLUMN error_kind TEXT"),
+                          ("kind", "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'")):
             if name not in cols:
                 c.execute(ddl)
 
@@ -113,22 +115,25 @@ class TaskStore:
     # ---------- 写入 ----------
 
     def enqueue(self, text, source="qq", sender=None, dedup_key=None,
-                priority=0, cwd=None):
-        """入队。dedup_key 重复时返回 (已有 task_id, True)。"""
+                priority=0, cwd=None, kind="task"):
+        """入队。dedup_key 重复时返回 (已有 task_id, True)。
+
+        kind：task（要动手的活）或 chat（闲聊通道），只影响提示词与会话，不影响排队规则。
+        """
         now = time.time()
         tid = uuid.uuid4().hex[:12]
         with self._db() as c:
             try:
                 c.execute(
                     "INSERT INTO tasks(id, source, sender, dedup_key, text, state,"
-                    " priority, cwd, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (tid, source, sender, dedup_key, text, "queued", priority, cwd, now))
+                    " priority, cwd, kind, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (tid, source, sender, dedup_key, text, "queued", priority, cwd, kind, now))
             except sqlite3.IntegrityError:
                 row = c.execute("SELECT id FROM tasks WHERE dedup_key=?", (dedup_key,)).fetchone()
                 return (row["id"] if row else None), True
             c.execute("INSERT INTO events(ts, task_id, kind, payload) VALUES(?,?,?,?)",
-                      (now, tid, "enqueued", json.dumps({"source": source, "text": text[:500]},
-                                                        ensure_ascii=False)))
+                      (now, tid, "enqueued", json.dumps({"source": source, "text": text[:500],
+                                                         "kind": kind}, ensure_ascii=False)))
         return tid, False
 
     def claim_next(self, exclude_cwds=None):

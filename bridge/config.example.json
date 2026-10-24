@@ -20,7 +20,12 @@
   "log_dir": "C:\\Users\\<user>\\qq-remote\\logs",
   "panel_port": 3099,
   "panel_token": "CHANGE_ME_panel_token",
-  "prompt_template": "【来自手机 QQ 的远程任务，主人不在电脑前】请直接在本机执行，完成后用纯文本给出简短结论（QQ 不渲染 Markdown 表格，避免使用）。任务：{task}",
+  "persona_path": "",
+  "memory_path": "",
+  "chat_prompt_template": "",
+  "task_prompt_template": "（手机 QQ 发来的任务，直接在本机执行）{task}\n做完用纯文本给一句结论，别用 Markdown 标题和表格。",
+  "show_footer": false,
+  "reminder_check_seconds": 20,
   "stream_text": true,
   "stream_text_min_chars": 80,
   "stream_text_interval": 1.5
