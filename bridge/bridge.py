@@ -960,6 +960,9 @@ def acquire_single_instance_lock():
     """
     import socket
     port = int(CFG.get("instance_lock_port", 30991))
+    # 测试/压测并行跑多个实例时用：instance_lock_port=0 或 QQ_REMOTE_NO_LOCK=1
+    if port == 0 or os.environ.get("QQ_REMOTE_NO_LOCK") == "1":
+        return True  # 非 socket，但非 None 即视为已获得
     s = socket.socket()
     try:
         s.bind(("127.0.0.1", port))

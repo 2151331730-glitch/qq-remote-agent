@@ -29,7 +29,7 @@ from store_redis import RedisStore  # noqa: E402
 
 def start_bridge(tmp, port, name):
     cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
-    cfg.update({
+    cfg.update({"instance_lock_port": 0,
         "napcat_ws": "ws://127.0.0.1:1",
         "log_dir": str(tmp / f"logs-{name}"),
         "panel_port": port,

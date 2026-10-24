@@ -3,12 +3,13 @@
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 from websockets.asyncio.client import connect
 
 from _cfg import napcat_token
 TOKEN = napcat_token()
-IMG = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\win11\qq-remote\tmp\roxy_anilist.png"
+IMG = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1] / "tmp" / "avatar.png")
 
 
 async def main():

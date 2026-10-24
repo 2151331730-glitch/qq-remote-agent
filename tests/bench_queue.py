@@ -52,7 +52,7 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="qqbench-"))
     db = tmp / "bench.db"
     cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
-    cfg.update({
+    cfg.update({"instance_lock_port": 0,
         "napcat_ws": "ws://127.0.0.1:1",          # 故意连不上：本次只压队列，不需要 QQ
         "log_dir": str(tmp),
         "db_path": str(db),

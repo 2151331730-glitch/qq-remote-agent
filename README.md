@@ -100,3 +100,10 @@ python tests\mock_test5.py         # 端到端：假 OneBot 服务端 + 真桥
 - `ARCHITECTURE.md` —— 架构与决策记录（ADR）
 - `progress.md` —— 逐次改动与踩坑史
 - `使用说明.md` —— 面向使用者的操作指南
+
+## 说明
+
+- 本项目是个人自用工具，文档里的路径按 `C:\Users\<user>\qq-remote` 组织。
+- 仓库内不含任何 token / QQ 号 / 密码；`bridge/config.json` 已在 `.gitignore` 中，
+  首次使用请从 `bridge/config.example.json` 复制并填入自己的值。
+- NapCat 属于第三方项目，不在本仓库内（`napcat/` 已忽略），需自行下载。

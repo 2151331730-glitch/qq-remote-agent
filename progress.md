@@ -1,10 +1,10 @@
-# QQ 远程任务 · 进度与决策记录
+﻿# QQ 远程任务 · 进度与决策记录
 
 ## 2026-10-24 建立
 
 ### 目标
 上课期间电脑常驻后台，手机 QQ 发任务 → 本机 claude 执行 → 结果回 QQ。
-用户选择：一次性号 3089461079 当机器人；权限全开（要"像在电脑上操作"）。
+用户选择：一次性号 <BOT_QQ> 当机器人；权限全开（要"像在电脑上操作"）。
 
 ### 已确定的技术选型与理由
 
@@ -29,7 +29,7 @@
 
 ### 已完成
 - [x] 目录 `C:\Users\win11\qq-remote\`
-- [x] NapCat 解压 + `onebot11_3089461079.json`（WS 127.0.0.1:3001，token）
+- [x] NapCat 解压 + `onebot11_<BOT_QQ>.json`（WS 127.0.0.1:3001，token）
 - [x] `bridge/bridge.py`（命令、队列、分段、心跳、超时、断线重连）
 - [x] `bridge/config.json`、`start-all.ps1`（守护重启）、`install-task.ps1`
 - [x] 电源：交流电永不休眠（原本就是 0）；合盖不睡眠；无线网卡最高性能
@@ -49,22 +49,22 @@
 - 绑定主人的那条消息原本会 return，导致第一个任务被吞（已改成绑定后继续执行）。
 
 ### 2026-10-24 16:10 真机登录成功（方式与原计划不同）
-- 二维码扫不了 → 改用 WebUI 的**「密码登录」**标签，账号 3089461079 + 密码直接登进去了，
+- 二维码扫不了 → 改用 WebUI 的**「密码登录」**标签，账号 <BOT_QQ> + 密码直接登进去了，
   没有触发短信/设备验证。
 - WebUI token：见 `napcat\config\webui.json`（**不写入文档，也不要打印**）。
-- 结果：`get_login_info` 返回 `{"user_id":3089461079,"nickname":"Sesame"}`；
+- 结果：`get_login_info` 返回 `{"user_id":<BOT_QQ>,"nickname":"<BOT_NICK>"}`；
   OneBot WS 3001 已监听；bridge 16:10:45 自动连上；`send_private_msg` 给自己返回 ok/0。
 - 好友列表目前只有它自己 —— 等用户大号加好友后才能端到端测。
 
 ### 2026-10-24 16:10-16:30 收尾与两个真 bug
-- **好友打通**：用户大号（郭欣哈）加好友成功，桥自动同意并绑定；
+- **好友打通**：用户大号（<OWNER>）加好友成功，桥自动同意并绑定；
   实测「在吗」→ 8 秒返回正常回复。
 - **Bug 1（严重）**：`serve()` 只 `await events.get()`，NapCat 重启导致连接断开后事件队列
   永远等不到，桥卡死不重连。改成 `asyncio.wait({get_task, reader})` 谁先完成先处理；
   `worker()` 提到 `main()` 全局只起一次，避免断线把正在跑的任务一起取消。
   用 `tests/mock_test4.py`（3002 端口 + 临时配置）验证：断开 → 立刻重连。
 - **Bug 2**：好友申请被 NapCat 推三次，桥批三次。加了 60 秒内按 flag 去重。
-- **WebUI 收紧**：host 改 127.0.0.1、`autoLoginAccount=3089461079`；**重启后自动登录成功**
+- **WebUI 收紧**：host 改 127.0.0.1、`autoLoginAccount=<BOT_QQ>`；**重启后自动登录成功**
   （WebUI 显示「QQ登录成功」，3001 自动起来，桥自动连上），不需要再扫码或输密码。
 - **踩坑**：`Set-Content -Encoding UTF8` 给 `webui.json` 写了 BOM，NapCat 解析失败退回默认，
   表现为 token 失效 + 自动登录不生效。已用 Python 重写为无 BOM。

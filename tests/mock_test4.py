@@ -12,7 +12,7 @@ from pathlib import Path
 
 from websockets.asyncio.server import serve
 
-ROOT = Path(r"C:\Users\win11\qq-remote")
+ROOT = Path(__file__).resolve().parents[1]  # 仓库根目录
 TMP = ROOT / "tests" / "tmp"
 TMP.mkdir(exist_ok=True)
 CONFIG = TMP / "test-config.json"

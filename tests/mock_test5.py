@@ -9,7 +9,7 @@ from pathlib import Path
 
 from websockets.asyncio.server import serve
 
-ROOT = Path(r"C:\Users\win11\qq-remote")
+ROOT = Path(__file__).resolve().parents[1]  # 仓库根目录
 TMP = ROOT / "tests" / "tmp"
 TMP.mkdir(exist_ok=True)
 CONFIG = TMP / "test5-config.json"
@@ -19,7 +19,7 @@ LOG_DIR = TMP / "logs5"
 LOG_DIR.mkdir(exist_ok=True)
 
 cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
-cfg.update({"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
+cfg.update({"instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
             "owner_uin": 0, "panel_port": 3097, "db_path": str(DB)})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 for p in (STATE, DB):
