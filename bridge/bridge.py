@@ -32,6 +32,7 @@ from websockets.asyncio.client import connect
 import sandbox
 import memory
 import context as context_mod
+import history
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
 from metrics import METRICS
@@ -121,6 +122,10 @@ CONTEXT_ENABLED = bool(CFG.get("context_enabled", True))
 CONTEXT_MESSAGES = int(CFG.get("context_messages", 12))
 CONTEXT_MAX_CHARS = int(CFG.get("context_max_chars", 1200))
 CONTEXT_PER_MESSAGE = int(CFG.get("context_per_message", 80))
+# 本地聊天记录：写入不花 token，进提示词才花；文件可全存，只喂最近一小段
+TRANSCRIPT_ENABLED = bool(CFG.get("transcript_enabled", True))
+TRANSCRIPT_DIR = Path(CFG.get("transcript_dir") or (BASE / "transcripts"))
+TRANSCRIPT_MAX_LINES = int(CFG.get("transcript_max_lines", 500))
 # 盯梢：长时间没有任何输出就提示/中止，避免"卡住没人知道"
 STALL_WARN_SEC = int(CFG.get("stall_warn_seconds", 90))
 STALL_KILL_SEC = int(CFG.get("stall_kill_seconds", 300))
@@ -713,10 +718,11 @@ async def _execute(row, cwd):
     kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
     started = time.time()
     # 闲聊没有历史会话时（刚重启/刚超限重置），拉最近私聊给模型接上话
-    history = ""
+    history_text = ""
     if kind == "chat" and CONTEXT_ENABLED and not get_session("chat"):
-        history = await fetch_history(user_id=STATE.get("owner_uin") or None)
-    prompt = build_prompt(kind, text, history=history)
+        history_text = (_file_context("owner")
+                        or await fetch_history(user_id=STATE.get("owner_uin") or None))
+    prompt = build_prompt(kind, text, history=history_text)
     STATE["current_task"] = text
     save_state()
     sync_gauges()
@@ -789,6 +795,7 @@ async def _execute(row, cwd):
     if kind == "chat":
         # 闲聊：不要 ✅ 前缀、不要 ⏱ 尾巴，直接说话
         await deliver(body or "（没有回话）", tid)
+        _record("owner", int(CFG.get("bot_uin") or 0), "我", body)
     else:
         footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok" if SHOW_FOOTER else ""
         await deliver(("✅ " if ok else "⚠️ ") + body + footer, tid)
@@ -888,6 +895,30 @@ def _group_text(data, self_id):
     return text.strip(), at_me
 
 
+def _record(scope: str, uid, name: str, text: str):
+    """把一句话落到本地记录；写盘失败不影响聊天。"""
+    if not TRANSCRIPT_ENABLED:
+        return
+    try:
+        history.append(TRANSCRIPT_DIR, scope, uid, name, text,
+                       max_lines=TRANSCRIPT_MAX_LINES)
+    except Exception as e:
+        logger.warning("写本地记录失败：%r", e)
+
+
+def _file_context(scope: str) -> str:
+    """本地记录里的最近几条，压成摘录；没有就返回空串（调用方再退回 NapCat）。"""
+    if not TRANSCRIPT_ENABLED:
+        return ""
+    try:
+        return history.tail(TRANSCRIPT_DIR, scope, limit=CONTEXT_MESSAGES,
+                            per_message=CONTEXT_PER_MESSAGE,
+                            max_chars=CONTEXT_MAX_CHARS)
+    except Exception as e:
+        logger.warning("读本地记录失败：%r", e)
+        return ""
+
+
 async def fetch_history(group_id=None, user_id=None) -> str:
     """拉最近消息并压成摘录；失败返回空串（不能因为拉历史失败就不回话）。"""
     if not CONTEXT_ENABLED or CLIENT is None:
@@ -933,13 +964,16 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
     started = time.time()
     audit(AUDIT_PATH, event="public_message", scope=scope, who=who, text=text[:300])
     log(f"公开聊天 [{scope}] {who}：{text[:80]}")
-    history = await fetch_history(
-        group_id=target_id if target_type == "group" else None,
-        user_id=target_id if target_type == "private" else None)
+    history_text = _file_context(scope)
+    if not history_text:
+        # 本地还没有记录（新群/刚部署）时，退回问 NapCat 要一次历史
+        history_text = await fetch_history(
+            group_id=target_id if target_type == "group" else None,
+            user_id=target_id if target_type == "private" else None)
     prompt = PUBLIC_TEMPLATE.replace("{task}", text)
-    if history:
+    if history_text:
         prompt = ("以下是这个会话最近的消息（供你理解上下文，不要逐条复述；"
-                  "最后一条是对方刚说的）：\n" + history + "\n\n" + prompt)
+                  "最后一条是对方刚说的）：\n" + history_text + "\n\n" + prompt)
     try:
         # 串行：同一时间只跑一次公开聊天，避免消息多时把机器和额度一起打满
         async with PUBLIC_SEM:
@@ -954,6 +988,7 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
     body = _plain(reply or "").strip() or "（我这边没说出话来，再说一遍试试？）"
     body = body[:PUBLIC_MAX_REPLY]
     sent = await send_to(target_type, target_id, body)
+    _record(scope, int(CFG.get("bot_uin") or 0), "我", body)
     if tin > SESSION_TOKEN_LIMIT:
         set_session("public", "", scope)   # 会话太长就换新的，避免每句都背着整段历史
     METRICS.inc("qq_remote_public_total", {"result": "ok" if ok else (err or "failed")})
@@ -968,6 +1003,7 @@ async def on_public_private(data, uid: int, text: str):
         log(f"陌生人私聊（没有文字，忽略）：{uid}")
         return
     log(f"陌生人私聊：{uid}：{text[:80]}")
+    _record(f"user:{uid}", uid, str(uid), text)
     await handle_public(f"user:{uid}", "private", uid, text, who=str(uid))
 
 
@@ -993,6 +1029,11 @@ async def on_group_message(data, self_id: int):
     if not gid or (self_id and uid == self_id):
         return
     text, at_me = _group_text(data, self_id)
+    sender = data.get("sender") or {}
+    name = sender.get("card") or sender.get("nickname") or str(uid)
+    # 群里的闲聊也落盘：被 @ 的时候这些就是"前情"（只写本地，不花 token）
+    if text:
+        _record(f"group:{gid}", uid, name, text)
     if not at_me:
         if not GROUP_PREFIX or not text.startswith(GROUP_PREFIX):
             METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
@@ -1005,8 +1046,6 @@ async def on_group_message(data, self_id: int):
         if at_me:
             await _group_hello(gid, uid)
         return
-    sender = data.get("sender") or {}
-    name = sender.get("card") or sender.get("nickname") or str(uid)
     # 群聊一律只陪聊：即使是主人，也不在群里执行任务（结果会公开可见）
     await handle_public(f"group:{gid}", "group", gid, text, who=f"{name}({uid})")
 
@@ -1501,6 +1540,8 @@ async def on_message(data):
         return
 
     log(f"收到：{text[:300]}")
+    # 主人私聊也留一份本地记录，重启/换会话后能靠它接上
+    _record("owner", uid, "主人", re.sub(r"\[CQ:[^\]]+\]", "", raw))
     if text.startswith("!"):
         await submit_shell(text, "qq")
         return

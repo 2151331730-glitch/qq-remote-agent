@@ -438,3 +438,35 @@
 
 - 上下文只拉**当前会话**：群里拉这个群，私聊拉和这个人，不跨会话。
 - 每次公开回复多约 1k 字符输入；嫌贵调小 `context_messages` 或关掉。
+
+## 2026-10-25 00:05 聊天记录落本地文件（上下文全存）
+
+### 需求
+
+「把上下文全存在电脑文件里得了，要消耗多少 token 吗」——要区分两件事：
+**存**不花 token，**喂进提示词**才花。
+
+### 做了什么
+
+- 新模块 `bridge/history.py`：`<root>/<scope>.jsonl`，一行一条
+  `{"ts","uid","name","text"}`；scope = `group_<gid>` / `user_<uid>` / `owner`。
+- 记录范围：群里**所有**消息（含没 @ 机器人的闲聊，正是"前情"）、陌生人私聊、主人私聊、
+  机器人自己的回复；每条压成一行、1000 字上限。
+- 上下文来源改为**本地优先**：`history.tail()` 取最近 12 条 → 有就不问 NapCat；
+  没有再回退 `get_group_msg_history` / `get_friend_msg_history`（新群/刚部署）。
+- 文件超过约 96KB 自动压缩到最近 500 条（`transcript_max_lines`）。
+- 目录 `bridge/transcripts/` 已 gitignore（私人内容，不进公开仓库）。
+- 配置：`transcript_enabled` / `transcript_dir` / `transcript_max_lines`。
+
+### token 账（实测基准）
+
+- 写文件：0 token。
+- 摘录上限 1200 字 ≈ 700–1000 token；一次公开回复总输入约 1.2 万 token（实测 11,659），
+  即占 6–8%。
+- 若把整个 500 条文件塞进提示词：约 1.2–2 万 token，成本翻倍——所以只喂尾部。
+
+### 验证
+
+- `pytest` → 119 passed, 12 skipped（新增 `test_history.py` 9 项）。
+- 端到端：群消息与机器人回复都落盘；陌生人私聊落盘；群上下文直接用本地文件，
+  mock 断言 `get_group_msg_history` **一次都没被调用**。全部通过。

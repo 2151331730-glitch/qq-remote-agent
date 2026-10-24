@@ -12,6 +12,8 @@ bridge/reminders.db
 bridge/reminders.db-*
 # 长期记忆是私人内容（称呼、日程、偏好），只留 example
 bridge/memory.md
+# 聊天记录也是私人内容
+bridge/transcripts/
 bridge/state.json
 bridge/*.bak-*
 tests/tmp/

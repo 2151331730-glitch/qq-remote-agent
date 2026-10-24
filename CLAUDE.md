@@ -44,6 +44,8 @@
 | `bridge\bridge.py` | 桥本体（asyncio，单客户端，串行队列≤5，超时 45 min，心跳 60 s） |
 | `bridge\intent.py` | 闲聊 / 任务分流规则（`classify()`，关键词 + 疑问句 + 路径） |
 | `bridge\reminders.py` | 提醒时间解析 + 独立 `reminders.db`（`/提醒` 系列命令） |
+| `bridge\context.py` | 把最近消息压成摘录（条数 / 每条字数 / 总长三重上限） |
+| `bridge\history.py` | 本地聊天记录（JSONL，`bridge\transcripts\`，私人内容不入库） |
 | `bridge\persona.md` | 人格设定，闲聊与任务共用；改完重启生效 |
 | `bridge\memory.py` | 长期记忆读写（纯文本，一行一条，超 4000 字丢最旧） |
 | `bridge\memory.md` | 长期记忆正文（**私人内容，不入库**；模板见 `memory.example.md`） |
@@ -121,10 +123,11 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
   `public_max_pending`（同时排队数）、`public_max_input_chars`（输入截断）、
   `public_max_reply_chars`（回复截断）。总开关 `public_chat`。
 - 公开回复不走发件箱（陌生人消息丢了就丢了，不值得入库），失败只记日志。
-- **自动读上下文**：`context.py` 把 `get_group_msg_history` / `get_friend_msg_history`
-  拉到的最近消息压成 `昵称: 内容` 摘录（默认 12 条、每条 80 字、总长 1200 字）。
-  公开聊天每次回复都带；主人闲聊只在**没有历史会话**（刚重启/超限重置）时带。
-  拉取失败只打 warning、照常回复。群与私聊各拉各的，不会串会话。
+- **自动读上下文**：回复前先从本地 `bridge/transcripts/<scope>.jsonl` 读最近 12 条
+  （`history.tail`），有记录就不问 NapCat；没有才回退 `get_group_msg_history` / `get_friend_msg_history`。
+  写入文件不花 token，进提示词的只是 ≤1200 字的摘录。群里的闲聊也会记录（作为前情），
+  scope 形如 `group_<gid>` / `user_<uid>` / `owner`。文件超约 96KB 自动留最近 500 条。
+  主人闲聊只在没有 `--resume` 会话时注入摘录。
 - 好友申请：陌生人 **不自动同意也不自动拒绝**（留在 QQ 里等主人处理），只私聊提醒主人一次/小时；
   只有 `owner_uin` 自己的申请会自动同意。不要改回"自动同意"，等于给陌生人开放私聊入口。
 - 未配置 `owner_uin` 时所有私聊都被忽略（旧版会绑定第一个发消息的人，已被移除，防账号劫持）。

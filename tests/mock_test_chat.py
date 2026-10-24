@@ -34,6 +34,7 @@ CONFIG = TMP / "chat-config.json"
 STATE = TMP / "chat-state.json"
 DB = TMP / "chat.db"
 REMINDERS = TMP / "chat-reminders.db"
+TRANSCRIPTS = TMP / "transcripts"
 LOG_DIR = TMP / "logs-chat"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -56,17 +57,21 @@ cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
             "persona_path": str(ROOT / "bridge" / "persona.md"),
             "memory_path": str(TMP / "chat-memory.md"),
             "public_chat": True, "public_cooldown_seconds": 1,
-            "public_max_per_hour": 50})
+            "public_max_per_hour": 50, "transcript_dir": str(TRANSCRIPTS)})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 for p in (STATE, DB, REMINDERS, TMP / "chat-memory.md"):
     if p.exists():
         p.unlink()
+if TRANSCRIPTS.exists():
+    import shutil
+    shutil.rmtree(TRANSCRIPTS)
 
 _MID = [3000]
 REPLIES = []          # 发给主人的私聊
 PUBLIC_REPLIES = []   # (uid, 文本) 发给陌生人的私聊
 GROUP_REPLIES = []    # (gid, 文本)
 FRIEND_ACTIONS = []   # set_friend_add_request 的参数
+HISTORY_CALLS = []    # 桥向 NapCat 要过哪些历史
 SCHEDULED = {"done": False}
 
 
@@ -115,8 +120,10 @@ async def handler(ws):
             action, params = d.get("action"), d.get("params") or {}
             data = {}
             if action == "get_group_msg_history":
+                HISTORY_CALLS.append(action)
                 data = {"messages": GROUP_HISTORY}
             elif action == "get_friend_msg_history":
+                HISTORY_CALLS.append(action)
                 data = {"messages": FRIEND_HISTORY}
             if action == "send_private_msg":
                 msg = params.get("message", "")
@@ -266,6 +273,19 @@ check(not any("人格设定" in msg for _, msg in GROUP_REPLIES), "群回复不�
 # 上下文：回复前会拉历史，摘录应出现在提示词里（stub 回显前 40 字）
 check(any("上下文" in msg for _, msg in GROUP_REPLIES), "群聊回复应自动带上最近对话摘录")
 check(any("上下文" in msg for _, msg in PUBLIC_REPLIES), "陌生私聊回复应自动带上最近对话摘录")
+
+# 本地记录：消息与回复都落盘，且群上下文优先用本地文件（不再问 NapCat 要历史）
+group_log = TRANSCRIPTS / "group_5555.jsonl"
+user_log = TRANSCRIPTS / "user_54321.jsonl"
+check(group_log.exists() and "讲个笑话" in group_log.read_text(encoding="utf-8"),
+      "群消息应落到本地记录")
+_entries = [json.loads(ln) for ln in group_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+check(any(e.get("name") == "我" and e.get("text", "").startswith("stub-ok") for e in _entries),
+      "机器人的群回复也应落盘")
+check(user_log.exists() and "你是谁" in user_log.read_text(encoding="utf-8"),
+      "陌生人私聊应落到本地记录")
+check("get_group_msg_history" not in HISTORY_CALLS,
+      "有本地记录时，群上下文不应再问 NapCat 要历史")
 
 # 好友申请：陌生人不动，主人同意
 check(len(FRIEND_ACTIONS) == 1, f"只应处理主人的好友申请，实际 {FRIEND_ACTIONS}")
