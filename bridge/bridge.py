@@ -935,11 +935,47 @@ async def handle_shell(text: str):
         await send(f"❌ 执行失败：{e}")
 
 
+
+INBOX = BASE / "tmp" / "inbox"
+
+
+async def _save_images(data):
+    """把消息里的图片分段下载到本地，返回路径列表（供模型 Read）。"""
+    import urllib.request
+    paths = []
+    segs = data.get("message")
+    if not isinstance(segs, list):
+        return paths
+    INBOX.mkdir(parents=True, exist_ok=True)
+    for seg in segs:
+        if seg.get("type") != "image":
+            continue
+        d = seg.get("data") or {}
+        url = d.get("url") or d.get("file")
+        if not url:
+            continue
+        dest = INBOX / f"{int(time.time())}-{uuid.uuid4().hex[:6]}.jpg"
+        try:
+            def _dl(u=url, p=dest):
+                with urllib.request.urlopen(u, timeout=20) as r, open(p, "wb") as f:
+                    f.write(r.read())
+            await asyncio.to_thread(_dl)
+            if dest.stat().st_size > 200:
+                paths.append(str(dest))
+        except Exception as e:
+            logger.warning("图片下载失败: %s", e)
+    return paths
+
+
 async def on_message(data):
     if data.get("post_type") != "message" or data.get("message_type") != "private":
         return
     uid = int(data.get("user_id", 0))
     text = (data.get("raw_message") or "").strip()
+    imgs = await _save_images(data)
+    if imgs:
+        note = "（主人发来的图片，请先用 Read 工具查看：" + "；".join(imgs) + "）"
+        text = (text + chr(10) * 2 + note) if text else note
     if not text:
         return
 
