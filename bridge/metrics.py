@@ -35,7 +35,8 @@ class Metrics:
             "qq_remote_task_duration_seconds": "任务执行时长直方图",
             "qq_remote_queue_depth": "当前排队任务数",
             "qq_remote_running": "当前执行中任务数",
-            "qq_remote_cost_usd_total": "累计花费（美元）",
+            "qq_remote_cost_usd_total": "累计花费（美元，CLI 估算值，仅供参考）",
+            "qq_remote_tokens_total": "token 用量，按方向（in 含缓存命中）",
         }
 
     # ---------- 写 ----------

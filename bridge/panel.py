@@ -60,7 +60,7 @@ pre{white-space:pre-wrap;word-break:break-word;margin:0;color:#c9d1d9;font-size:
 <button type="button" class="ghost" onclick="load()">刷新</button>
 </form>
 <div id="msg"></div>
-<table><thead><tr><th>时间</th><th>ID</th><th>来源</th><th>状态</th><th>耗时</th><th>花费</th><th>内容</th></tr></thead>
+<table><thead><tr><th>时间</th><th>ID</th><th>来源</th><th>状态</th><th>耗时</th><th>token</th><th>内容</th></tr></thead>
 <tbody id="rows"></tbody></table>
 </div>
 <script>
@@ -81,6 +81,7 @@ async function load(){
       ['24h 成功率', (st.success_rate ?? 0).toFixed(0) + '%'],
       ['时延 p50', ms(st.p50_ms)],
       ['时延 p95', ms(st.p95_ms)],
+      ['token 入/出', ((st.tokens_in ?? 0)/1000).toFixed(0) + 'k / ' + ((st.tokens_out ?? 0)/1000).toFixed(0) + 'k'],
       ['累计花费', '$' + (st.cost ?? 0).toFixed(3)],
       ['在线', (st.uptime_hours ?? 0).toFixed(1) + 'h'],
       ['worker', st.workers ?? 1],
@@ -97,7 +98,7 @@ async function load(){
       const ts = r.created_at ? new Date(r.created_at*1000).toLocaleString('zh-CN',{hour12:false}).slice(5) : '';
       return `<tr><td>${esc(ts)}</td><td><span class="tag">${esc(r.id)}</span></td><td>${esc(r.source)}</td>
         <td class="${CLS[r.state]||''}">${ICON[r.state]||''} ${esc(r.state)}</td>
-        <td>${ms(r.duration_ms)}</td><td>$${(r.cost_usd||0).toFixed(3)}</td>
+        <td>${ms(r.duration_ms)}</td><td>${((r.tokens_in||0)/1000).toFixed(0)}k/${((r.tokens_out||0)/1000).toFixed(1)}k</td>
         <td><pre>${esc((r.result || r.text || '').slice(0,300))}</pre></td></tr>`;
     }).join('') || '<tr><td colspan="7" style="color:#7d8590">暂无任务</td></tr>';
   }catch(err){ $('#msg').textContent = '读取失败：' + err; }

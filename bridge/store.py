@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     duration_ms INTEGER,
     exit_code   INTEGER,
     cost_usd    REAL NOT NULL DEFAULT 0,
+    tokens_in   INTEGER NOT NULL DEFAULT 0,
+    tokens_out  INTEGER NOT NULL DEFAULT 0,
     result      TEXT,
     error       TEXT
 );
@@ -64,6 +66,16 @@ class TaskStore:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            self._migrate(c)
+
+    @staticmethod
+    def _migrate(c):
+        """轻量迁移：老库缺列就补上（CREATE TABLE IF NOT EXISTS 不会改已存在的表）。"""
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
+        for name, ddl in (("tokens_in", "ALTER TABLE tasks ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"),
+                          ("tokens_out", "ALTER TABLE tasks ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")):
+            if name not in cols:
+                c.execute(ddl)
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=5)
@@ -114,7 +126,7 @@ class TaskStore:
                       (task_id,))
 
     def finish(self, task_id, state, result=None, error=None, exit_code=None,
-               cost_usd=0.0, duration_ms=None):
+               cost_usd=0.0, duration_ms=None, tokens_in=0, tokens_out=0):
         assert state in TERMINAL, state
         now = time.time()
         with self._conn() as c:
@@ -123,8 +135,10 @@ class TaskStore:
                 duration_ms = int((now - row["started_at"]) * 1000)
             c.execute(
                 "UPDATE tasks SET state=?, finished_at=?, duration_ms=?, exit_code=?,"
-                " cost_usd=cost_usd+?, result=?, error=? WHERE id=?",
+                " cost_usd=cost_usd+?, tokens_in=tokens_in+?, tokens_out=tokens_out+?,"
+                " result=?, error=? WHERE id=?",
                 (state, now, duration_ms, exit_code, cost_usd or 0,
+                 int(tokens_in or 0), int(tokens_out or 0),
                  (result or "")[:20000], (error or "")[:2000], task_id))
             c.execute("INSERT INTO events(ts, task_id, kind, payload) VALUES(?,?,?,?)",
                       (now, task_id, state,
@@ -198,6 +212,9 @@ class TaskStore:
                 (since,)).fetchone()["v"]
             cost_total = c.execute(
                 "SELECT COALESCE(SUM(cost_usd),0) v FROM tasks").fetchone()["v"]
+            tk = c.execute(
+                "SELECT COALESCE(SUM(tokens_in),0) i, COALESCE(SUM(tokens_out),0) o FROM tasks"
+            ).fetchone()
         return {
             "counts": counts,
             "done": counts.get("succeeded", 0),
@@ -210,6 +227,8 @@ class TaskStore:
             "p50_ms": _pct(durs, 50),
             "p95_ms": _pct(durs, 95),
             "total_cost": round(cost_total, 4),
+            "tokens_in": tk["i"],
+            "tokens_out": tk["o"],
         }
 
     def events(self, limit=100, task_id=None):

@@ -211,8 +211,13 @@ def _session_invalid(msg: str) -> bool:
         "could not find session", "invalid session"))
 
 
-async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, float, int]:
-    """跑一次 claude -p。返回 (成功?, 给用户看的文本, 成本, 退出码)。"""
+async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, float, int, int, int]:
+    """跑一次 claude -p。
+
+    返回 (成功?, 给用户看的文本, CLI 估算成本, 退出码, 输入 token, 输出 token)。
+    注意 cost_usd 是 CLI 按 Claude 价目表估的值，DeepSeek 侧实际计费不同，
+    所以成本只作参考；token 数才是能横向比较的指标。
+    """
     global COST_TOTAL, LAST_RESULT
     # 多 worker 并发时不许共用同一个 --resume 会话，否则上下文会互相污染
     use_session = WORKERS == 1
@@ -262,17 +267,17 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
     resumed = bool(STATE.get("session_id")) and use_session
     out, err, code = await _once(resumed)
     if out is None:
-        return False, err, 0.0, code
+        return False, err, 0.0, code, 0, 0
 
     data = _parse(out)
     if data is None and resumed and _session_invalid(err or out):
         log("resume 失败（旧会话不存在），改用新会话重试")
         out, err, code = await _once(False)
         if out is None:
-            return False, err, 0.0, code
+            return False, err, 0.0, code, 0, 0
         data = _parse(out)
     if data is None:
-        return False, f"❌ claude 输出无法解析：\n{(err or out or '')[-800:]}", 0.0, code
+        return False, f"❌ claude 输出无法解析：\n{(err or out or '')[-800:]}", 0.0, code, 0, 0
 
     sid = data.get("session_id")
     if sid and use_session:
@@ -281,6 +286,12 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
 
     cost = float(data.get("total_cost_usd") or 0)
     COST_TOTAL += cost
+    usage = data.get("usage") or {}
+    # 输入 token 要把缓存命中的也算进去，否则 resume 会话的成本会被低估
+    tokens_in = int(usage.get("input_tokens") or 0) \
+        + int(usage.get("cache_read_input_tokens") or 0) \
+        + int(usage.get("cache_creation_input_tokens") or 0)
+    tokens_out = int(usage.get("output_tokens") or 0)
     text = data.get("result") or ""
     is_error = bool(data.get("is_error"))
     LAST_RESULT = text
@@ -290,7 +301,7 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
         pass
     if text and len(text) > 3000:
         text = f"{text[:3000]}\n\n……（结果较长，共 {len(text)} 字，发 /全文 看剩下部分）"
-    return (not is_error), (text or "（任务完成，没有文字输出）"), cost, code
+    return (not is_error), (text or "（任务完成，没有文字输出）"), cost, code, tokens_in, tokens_out
 
 
 async def _cwd_lock(cwd: str) -> asyncio.Lock:
@@ -340,9 +351,9 @@ async def _execute(row, cwd):
     run_task = asyncio.create_task(run_claude(prompt, tid, cwd))
     RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd}
     hb = asyncio.create_task(heartbeat(tid, started))
-    cost = 0.0
+    cost, tin, tout = 0.0, 0, 0
     try:
-        ok, reply, cost, code = await run_task
+        ok, reply, cost, code, tin, tout = await run_task
     except asyncio.CancelledError:
         if not run_task.cancelled():
             raise
@@ -354,19 +365,23 @@ async def _execute(row, cwd):
         return
     except Exception as e:
         logger.exception("task exception")
-        ok, reply, cost, code = False, f"❌ 执行异常：{e}", 0.0, -1
+        ok, reply, cost, code, tin, tout = False, f"❌ 执行异常：{e}", 0.0, -1, 0, 0
     finally:
         hb.cancel()
 
     seconds = time.time() - started
     state = "succeeded" if ok else "failed"
     STORE.finish(tid, state, result=reply, error=None if ok else reply,
-                 exit_code=code, cost_usd=cost, duration_ms=int(seconds * 1000))
+                 exit_code=code, cost_usd=cost, duration_ms=int(seconds * 1000),
+                 tokens_in=tin, tokens_out=tout)
     METRICS.inc("qq_remote_tasks_total", {"state": state})
     METRICS.observe("qq_remote_task_duration_seconds", seconds)
     METRICS.inc("qq_remote_cost_usd_total", {}, cost)
+    METRICS.inc("qq_remote_tokens_total", {"direction": "in"}, tin)
+    METRICS.inc("qq_remote_tokens_total", {"direction": "out"}, tout)
     audit(AUDIT_PATH, event="task_end", id=tid, source=row["source"], ok=ok,
-          seconds=round(seconds, 1), cost_usd=round(cost, 6), result=(reply or "")[:2000])
+          seconds=round(seconds, 1), cost_usd=round(cost, 6),
+          tokens_in=tin, tokens_out=tout, result=(reply or "")[:2000])
     log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s")
     await send(("✅ " if ok else "⚠️ ") + reply)
     _cleanup(tid)
@@ -437,7 +452,8 @@ async def handle_command(text: str) -> bool:
             f"完成 {st['done']} · 失败 {st['failed']}\n"
             f"24h 成功率 {rate:.0f}%（{st['window_runs']} 次）\n"
             f"时延 p50 {_fmt_ms(st['p50_ms'])} · p95 {_fmt_ms(st['p95_ms'])}\n"
-            f"24h 花费 ${st['window_cost']:.3f} · 累计 ${st['total_cost']:.3f}\n"
+            f"token 累计 入 {st['tokens_in'] / 1000:.0f}k / 出 {st['tokens_out'] / 1000:.0f}k\n"
+            f"24h 花费 ${st['window_cost']:.3f}（估算）· 累计 ${st['total_cost']:.3f}\n"
             f"工作目录：{STATE.get('cwd')}\n"
             f"会话：{(STATE.get('session_id') or '无')[:8]}  worker：{WORKERS}"
         )
@@ -774,6 +790,8 @@ def panel_state():
         "pending_confirm": bool(PENDING_CONFIRM.get("entry")),
         "p50_ms": st["p50_ms"],
         "p95_ms": st["p95_ms"],
+        "tokens_in": st["tokens_in"],
+        "tokens_out": st["tokens_out"],
         "success_rate": (st["done"] / (st["done"] + st["failed"]) * 100)
                         if (st["done"] + st["failed"]) else 0,
         "workers": WORKERS,

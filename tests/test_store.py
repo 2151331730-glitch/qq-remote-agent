@@ -108,3 +108,33 @@ def test_daily_buckets(store):
     store.finish(tid, "succeeded", duration_ms=10)
     days = store.daily(7)
     assert len(days) == 1 and days[0]["n"] == 1 and days[0]["ok"] == 1
+
+
+def test_finish_records_tokens(store):
+    tid, _ = store.enqueue("x")
+    store.claim_next()
+    store.finish(tid, "succeeded", tokens_in=1200, tokens_out=34)
+    row = store.get(tid)
+    assert row["tokens_in"] == 1200 and row["tokens_out"] == 34
+    assert store.stats()["tokens_in"] == 1200
+
+
+def test_migration_adds_token_columns(tmp_path):
+    """老库没有 tokens_* 列时，打开就自动补列（不丢历史数据）。"""
+    import sqlite3
+    p = tmp_path / "old.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, source TEXT NOT NULL, sender TEXT,"
+              " dedup_key TEXT UNIQUE, text TEXT NOT NULL, state TEXT NOT NULL,"
+              " priority INTEGER NOT NULL DEFAULT 0, cwd TEXT, attempts INTEGER NOT NULL DEFAULT 0,"
+              " created_at REAL NOT NULL, started_at REAL, finished_at REAL, duration_ms INTEGER,"
+              " exit_code INTEGER, cost_usd REAL NOT NULL DEFAULT 0, result TEXT, error TEXT)")
+    c.execute("INSERT INTO tasks(id, source, text, state, created_at)"
+              " VALUES('old1','qq','历史任务','succeeded', 1.0)")
+    c.commit()
+    c.close()
+
+    s = TaskStore(p)
+    row = s.get("old1")
+    assert row["text"] == "历史任务"
+    assert row["tokens_in"] == 0 and row["tokens_out"] == 0

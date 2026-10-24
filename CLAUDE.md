@@ -42,8 +42,12 @@
 | `restart-bridge.ps1` | **唯一正确的重启入口**：停任务 → 先杀 claude 子进程 → 杀 bridge → 重启任务；日志写 `logs\restart.txt` |
 | `自检.ps1` | 出门前六项体检 + 最近 6 行日志 |
 | `bridge\bridge.py` | 桥本体（asyncio，单客户端，串行队列≤5，超时 45 min，心跳 60 s） |
+| `bridge\store.py` | **任务状态机 + 幂等 + 恢复**（SQLite WAL）：queued→running→succeeded/failed/cancelled/interrupted |
+| `bridge\metrics.py` | 计数/仪表/直方图，输出 Prometheus 文本 |
 | `bridge\guard.py` | 危险词/危险命令识别 → 要求 `/确认`；审计写 `logs\audit.jsonl` |
-| `bridge\panel.py` | 3099 看板 |
+| `bridge\panel.py` | 3099 看板 + `/api/*` + `/metrics` |
+| `bridge\tasks.db` | 任务与事件表（**不入库**，运行时生成） |
+| `bridge\config.example.json` | 配置模板；真正的 `config.json` 含 token，**不入库** |
 | `bridge\config.json` | 机器人号 / 主人号 / WS 地址 / token / claude 路径 / 工作目录 |
 | `bridge\state.json` | `owner_uin` / `session_id` / `cwd` / `current_task` / `cost_total`（原子写） |
 | `logs\bridge.log` | 主日志（收到/任务开始/任务结束/心跳） |
@@ -91,10 +95,21 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 | 重启电脑后不跑 | 计划任务是否注册、是否 `RunLevel Highest` |
 | 改了代码没效果 | 见上节：进程启动时间 vs 文件修改时间 |
 
+## 任务队列语义（改队列前必读）
+
+- 状态机：`queued → running → succeeded | failed | cancelled | interrupted`，只有 `queued` 能被 `/取消 <ID>`。
+- 幂等：`dedup_key = qq:<message_id>` 有唯一索引，重复投递直接丢弃（`store.enqueue` 返回 `dup=True`）。
+- 崩溃恢复：启动时 `recover_interrupted()` 把残留 `running` 标成 `interrupted`，并在连上 QQ 后主动通知。
+- 并发：`workers` 配置默认 1；多个 worker 时按 `cwd` 加 `asyncio.Lock`，同目录串行；**多 worker 会禁用 `--resume`**，避免共享同一会话。
+- 背压：`STORE.queue_depth() >= max_queue` 直接拒绝，不无限堆积。
+
 ## 开发约定
 
-- **测试要隔离**：用环境变量 `QQ_REMOTE_CONFIG` / `QQ_REMOTE_STATE` 指向临时文件 + 3002 端口，别碰真机 3001。
+- **测试要隔离**：用环境变量 `QQ_REMOTE_CONFIG` / `QQ_REMOTE_STATE` / `QQ_REMOTE_DB` 指向临时文件 + 3002 端口，别碰真机 3001。
+- 单测：`python -m pytest tests -q`（store / guard / metrics / panel 共 42 个）。
+- 端到端：`python tests\mock_test5.py`（假 OneBot 服务端 + 真桥）。
 - 改完至少 `python -m py_compile bridge\bridge.py`；有对应 mock 测试就跑一遍。
+- **token 一律从 config 读，不写进代码/文档**；`bridge/config.json` 已被 .gitignore 排除。
 - `state.json` 必须原子写（临时文件 + `os.replace`）。
 - **token、密码、QQ 密码一律不打印**，需要时从文件读。
 - 新增危险能力先过 `guard.py` 的判定，别绕过。
