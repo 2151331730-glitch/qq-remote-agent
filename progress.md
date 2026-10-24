@@ -218,7 +218,7 @@
 
 ### 2026-10-24 19:10-19:35 公开仓库 + Docker 沙箱实机验证
 
-- **公开仓库**：`https://github.com/2151331730-glitch/qq-remote-agent`（MIT）。
+- **公开仓库**：`https://github.com/<OWNER_QQ>-glitch/qq-remote-agent`（MIT）。
   推之前做了脱敏：QQ 号/昵称替占位符、测试改用相对路径、`apply-webui.ps1` 从配置读号、
   `bridge/config.json` 不入库（只有 example）。
 - **CI 三次失败教会三件事**：

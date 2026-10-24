@@ -627,7 +627,7 @@ async def heartbeat(tid, started):
     while True:
         await asyncio.sleep(HEARTBEAT_SEC)
         mins = (time.time() - started) / 60
-        await send(f"⏳ 还在执行（已 {mins:.0f} 分钟）…")
+        await deliver(f"⏳ 还在执行（已 {mins:.0f} 分钟）…", tid)
 
 
 # ---------------- 命令 ----------------
@@ -973,6 +973,24 @@ async def on_message(data):
     uid = int(data.get("user_id", 0))
     text = (data.get("raw_message") or "").strip()
     imgs = await _save_images(data)
+    # 有些 NapCat 配置把图片发成 CQ 码字符串（不是结构化分段），单独兜一层
+    import re as _re
+    for m in _re.finditer(r"\[CQ:image,([^\]]+)\]", text):
+        kv = dict(x.split("=", 1) for x in m.group(1).split(",") if "=" in x)
+        url = (kv.get("url") or kv.get("file") or "").replace("&amp;", "&")
+        if url:
+            try:
+                import urllib.request
+                INBOX.mkdir(parents=True, exist_ok=True)
+                dest = INBOX / f"{int(time.time())}-{uuid.uuid4().hex[:6]}.jpg"
+                with urllib.request.urlopen(url, timeout=20) as r, open(dest, "wb") as f:
+                    f.write(r.read())
+                if dest.stat().st_size > 200:
+                    imgs.append(str(dest))
+            except Exception as e:
+                logger.warning("CQ 图片下载失败: %s", e)
+    if imgs:
+        text = _re.sub(r"\[CQ:image,[^\]]+\]", "", text).strip()
     if imgs:
         note = "（主人发来的图片，请先用 Read 工具查看：" + "；".join(imgs) + "）"
         text = (text + chr(10) * 2 + note) if text else note
