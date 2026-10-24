@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""v2 回归：持久化队列 + 幂等 + 命令（3002 端口 + 独立 state/db，不碰真机）。"""
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from websockets.asyncio.server import serve
+
+ROOT = Path(r"C:\Users\win11\qq-remote")
+TMP = ROOT / "tests" / "tmp"
+TMP.mkdir(exist_ok=True)
+CONFIG = TMP / "test5-config.json"
+STATE = TMP / "test5-state.json"
+DB = TMP / "test5.db"
+LOG_DIR = TMP / "logs5"
+LOG_DIR.mkdir(exist_ok=True)
+
+cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
+cfg.update({"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
+            "owner_uin": 0, "panel_port": 3097, "db_path": str(DB)})
+CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+for p in (STATE, DB):
+    if p.exists():
+        p.unlink()
+
+TOKEN = cfg["napcat_token"]
+_MID = [2000]
+REPLIES = []
+
+
+def ev(text, mid=None):
+    if mid is None:
+        _MID[0] += 1
+        mid = _MID[0]
+    return json.dumps({
+        "post_type": "message", "message_type": "private", "sub_type": "friend",
+        "self_id": 999, "user_id": 12345, "raw_message": text,
+        "message": [{"type": "text", "data": {"text": text}}],
+        "message_id": mid, "time": 0,
+    }, ensure_ascii=False)
+
+
+async def handler(ws):
+    print("[mock] 桥已连接", flush=True)
+
+    async def receiver():
+        async for raw in ws:
+            d = json.loads(raw)
+            if d.get("action") == "send_private_msg":
+                msg = d["params"]["message"]
+                REPLIES.append(msg)
+                print(f"[回信] {msg[:180]}", flush=True)
+            if d.get("echo") is not None:
+                await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": {},
+                                          "echo": d["echo"]}, ensure_ascii=False))
+
+    async def say(delay, text, mid=None):
+        await asyncio.sleep(delay)
+        print(f"\n[mock] >>> {text}", flush=True)
+        await ws.send(ev(text, mid))
+
+    await asyncio.gather(
+        asyncio.create_task(receiver()),
+        asyncio.create_task(say(0.5, "/心跳")),
+        asyncio.create_task(say(2.0, "!echo 新队列可用")),
+        asyncio.create_task(say(4.0, "只回复三个字：桥可用", mid=2100)),
+        # 同一条 message_id 再投一次 → 必须被幂等丢掉，不能跑第二遍
+        asyncio.create_task(say(16.0, "只回复三个字：桥可用", mid=2100)),
+        asyncio.create_task(say(18.0, "/任务 5")),
+        asyncio.create_task(say(20.0, "/状态")),
+        asyncio.create_task(say(30.0, "/心跳")),
+    )
+
+
+async def main():
+    async with serve(handler, "127.0.0.1", 3002):
+        print("[mock] 服务已起 3002", flush=True)
+        env = dict(os.environ, QQ_REMOTE_CONFIG=str(CONFIG), QQ_REMOTE_STATE=str(STATE),
+                   QQ_REMOTE_DB=str(DB))
+        bridge = subprocess.Popen([sys.executable, str(ROOT / "bridge" / "bridge.py")],
+                                  cwd=str(ROOT / "bridge"), env=env)
+        await asyncio.sleep(38)
+        bridge.terminate()
+        try:
+            bridge.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge.kill()
+
+
+asyncio.run(main())
+print("\n=== 数据库里的任务 ===")
+import sqlite3  # noqa: E402
+
+c = sqlite3.connect(DB)
+for row in c.execute("SELECT id, state, source, substr(text,1,24) FROM tasks ORDER BY created_at"):
+    print(row)

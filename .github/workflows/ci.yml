@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: pip install pytest websockets
+      - name: 单元测试
+        env:
+          PYTHONUTF8: "1"
+        run: python -m pytest tests -q
+      - name: 语法检查
+        env:
+          PYTHONUTF8: "1"
+        run: python -m py_compile bridge/bridge.py bridge/store.py bridge/metrics.py bridge/panel.py bridge/guard.py

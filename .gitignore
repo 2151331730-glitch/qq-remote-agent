@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行时产物（含 token、聊天内容，绝不入库）
+logs/
+tmp/
+downloads/
+bridge/tasks.db
+bridge/tasks.db-*
+bridge/state.json
+bridge/*.bak-*
+tests/tmp/
+tools/*.log
+
+# 第三方 / 大件：NapCat 是下载解压的，不入库（含 token 的配置也在这里面）
+napcat/
+downloads/
+
+# 本机专用
+.venv/

@@ -1,0 +1,18 @@
+{
+  "bot_uin": 3089461079,
+  "owner_uin": 2151331730,
+  "napcat_ws": "ws://127.0.0.1:3001",
+  "napcat_token": "a7f3c9d21b8e4650",
+  "claude_exe": "C:\\Users\\win11\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+  "workdir": "C:\\Users\\win11",
+  "task_timeout_minutes": 45,
+  "heartbeat_seconds": 60,
+  "max_queue": 5,
+  "workers": 1,
+  "chunk_size": 1200,
+  "db_path": "C:\\Users\\win11\\qq-remote\\bridge\\tasks.db",
+  "log_dir": "C:\\Users\\win11\\qq-remote\\logs",
+  "prompt_template": "【来自手机 QQ 的远程任务，主人不在电脑前】请直接在本机执行，完成后用纯文本给出简短结论（QQ 不渲染 Markdown 表格，避免使用）。任务：{task}",
+  "panel_port": 3099,
+  "panel_token": "6b9807129f4710caf8b3b6d5"
+}
