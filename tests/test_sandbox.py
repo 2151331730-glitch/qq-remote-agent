@@ -23,8 +23,8 @@ def test_wsl_backend():
 
 def test_docker_backend_is_networkless_and_mounts_cwd():
     argv = sandbox.build_command("echo hi", r"C:\work", "docker")
-    # 可能是 PATH 里的 docker，也可能是 Docker Desktop 的固定路径
-    assert argv[0].endswith("docker") or argv[0].endswith("docker.exe")
+    # 可能是 PATH 里的 docker（Windows 上是 docker.EXE），也可能是 Docker Desktop 的固定路径
+    assert argv[0].lower().endswith(("docker", "docker.exe"))
     assert "--network" in argv and "none" in argv
     assert "--rm" in argv
     assert any(a.endswith(":/work") for a in argv)
