@@ -15,11 +15,53 @@
 """
 import shutil
 import subprocess
+import time
+from pathlib import Path
 
 DOCKER_IMAGE = "alpine:3.20"
 
 
+DOCKER_CANDIDATES = (
+    r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    r"C:\Program Files\Docker\Docker\resources\bin\docker",
+)
+
+
+def docker_bin():
+    """Docker Desktop 装好但没进 PATH 是常见情况，这里直接找固定路径。"""
+    found = shutil.which("docker")
+    if found:
+        return found
+    for p in DOCKER_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return None
+
+
+_DOCKER_CACHE = {"ts": 0.0, "ok": False}
+
+
+def docker_ready(force=False):
+    """Docker 装了不等于引擎在跑（Docker Desktop 常关着省电）。探测结果缓存 60 秒。"""
+    now = time.time()
+    if not force and now - _DOCKER_CACHE["ts"] < 60:
+        return _DOCKER_CACHE["ok"]
+    bin_path = docker_bin()
+    ok = False
+    if bin_path:
+        try:
+            r = subprocess.run([bin_path, "version", "--format", "{{.Server.Version}}"],
+                               capture_output=True, timeout=6)
+            ok = r.returncode == 0 and bool((r.stdout or b"").strip())
+        except Exception:
+            ok = False
+    _DOCKER_CACHE.update(ts=now, ok=ok)
+    return ok
+
+
 def _has(cmd):
+    if cmd == "docker":
+        return docker_ready()
     return shutil.which(cmd) is not None
 
 
@@ -49,7 +91,7 @@ def _win_to_wsl(path: str) -> str:
 def build_command(cmd: str, cwd: str, backend: str):
     """把一条命令包装成对应后端的 argv。"""
     if backend == "docker":
-        return ["docker", "run", "--rm", "--network", "none",
+        return [docker_bin() or "docker", "run", "--rm", "--network", "none",
                 "-v", f"{cwd}:/work", "-w", "/work", DOCKER_IMAGE, "sh", "-lc", cmd]
     if backend == "wsl":
         return ["wsl", "-e", "bash", "-lc", f"cd {_win_to_wsl(cwd)} 2>/dev/null; {cmd}"]
@@ -59,7 +101,10 @@ def build_command(cmd: str, cwd: str, backend: str):
 
 
 def pick_backend(preferred: str = "auto"):
-    """选一个可用后端；preferred=auto 时优先 docker → wsl → powershell。"""
+    """选一个可用后端；preferred=auto 时优先 docker → wsl → powershell。
+
+    Docker Desktop 没运行时会自动落到 WSL，不会因为"装了但没开"而失败。
+    """
     if preferred and preferred != "auto":
         return preferred
     for b in ("docker", "wsl"):

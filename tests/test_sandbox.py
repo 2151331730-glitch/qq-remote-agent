@@ -23,7 +23,8 @@ def test_wsl_backend():
 
 def test_docker_backend_is_networkless_and_mounts_cwd():
     argv = sandbox.build_command("echo hi", r"C:\work", "docker")
-    assert argv[0] == "docker"
+    # 可能是 PATH 里的 docker，也可能是 Docker Desktop 的固定路径
+    assert argv[0].endswith("docker") or argv[0].endswith("docker.exe")
     assert "--network" in argv and "none" in argv
     assert "--rm" in argv
     assert any(a.endswith(":/work") for a in argv)
@@ -36,3 +37,21 @@ def test_pick_explicit_backend():
 
 def test_available_always_has_powershell():
     assert "powershell" in sandbox.available_backends()
+
+
+def test_pick_backend_falls_back_when_docker_not_running(monkeypatch):
+    """装了 Docker 但引擎没起 → 必须退回 WSL/PowerShell，而不是报错。"""
+    monkeypatch.setattr(sandbox, "docker_ready", lambda force=False: False)
+    monkeypatch.setattr(sandbox, "available_backends", lambda: ["wsl", "powershell"])
+    assert sandbox.pick_backend("auto") == "wsl"
+
+
+def test_pick_backend_prefers_docker_when_ready(monkeypatch):
+    monkeypatch.setattr(sandbox, "docker_ready", lambda force=False: True)
+    monkeypatch.setattr(sandbox, "available_backends", lambda: ["docker", "wsl", "powershell"])
+    assert sandbox.pick_backend("auto") == "docker"
+
+
+def test_explicit_backend_respected(monkeypatch):
+    monkeypatch.setattr(sandbox, "docker_ready", lambda force=False: False)
+    assert sandbox.pick_backend("powershell") == "powershell"
