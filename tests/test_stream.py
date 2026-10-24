@@ -16,9 +16,18 @@ ROOT = Path(__file__).resolve().parents[1]
 STUB = ROOT / "tests" / "stub_claude.py"
 
 
+def _base_config():
+    """CI 里没有 config.json（含 token，不入库），退回 example。"""
+    for name in ("config.json", "config.example.json"):
+        p = ROOT / "bridge" / name
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    raise FileNotFoundError("找不到 config.json 或 config.example.json")
+
+
 @pytest.fixture()
 def bridge_mod(tmp_path, monkeypatch):
-    cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
+    cfg = _base_config()
     cfg.update({
         "napcat_ws": "ws://127.0.0.1:1",
         "log_dir": str(tmp_path),
