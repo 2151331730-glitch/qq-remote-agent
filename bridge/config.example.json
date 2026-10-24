@@ -2,7 +2,7 @@
   "bot_uin": 0,
   "owner_uin": 0,
   "napcat_ws": "ws://127.0.0.1:3001",
-  "napcat_token": "<OneBot WS token，自己生成>",
+  "napcat_token": "CHANGE_ME_ws_token",
   "claude_exe": "C:\\Users\\<user>\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
   "workdir": "C:\\Users\\<user>",
   "task_timeout_minutes": 45,
@@ -19,6 +19,6 @@
   "db_path": "C:\\Users\\<user>\\qq-remote\\bridge\\tasks.db",
   "log_dir": "C:\\Users\\<user>\\qq-remote\\logs",
   "panel_port": 3099,
-  "panel_token": "<看板 token，自己生成>",
+  "panel_token": "CHANGE_ME_panel_token",
   "prompt_template": "【来自手机 QQ 的远程任务，主人不在电脑前】请直接在本机执行，完成后用纯文本给出简短结论（QQ 不渲染 Markdown 表格，避免使用）。任务：{task}"
 }

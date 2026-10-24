@@ -13,3 +13,7 @@
 [ 131s] rss=  50.2MB cpu=28.5% queue= 43 done= 218 failed= 0 p95=569ms
 [ 141s] rss=  52.4MB cpu=27.5% queue= 46 done= 235 failed= 0 p95=569ms
 [ 151s] rss=  54.5MB cpu=27.9% queue= 49 done= 252 failed= 0 p95=568ms
+[ 161s] rss=  37.4MB cpu=27.6% queue= 52 done= 269 failed= 0 p95=568ms
+[ 171s] rss=  39.8MB cpu=25.1% queue= 55 done= 286 failed= 0 p95=567ms
+[ 181s] rss=  41.7MB cpu=27.1% queue= 58 done= 303 failed= 0 p95=566ms
+[ 191s] rss=  43.7MB cpu=28.2% queue= 61 done= 320 failed= 0 p95=564ms

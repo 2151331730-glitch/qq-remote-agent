@@ -20,7 +20,8 @@ LOG_DIR.mkdir(exist_ok=True)
 
 base_name = "config.json" if (ROOT / "bridge" / "config.json").exists() else "config.example.json"
 cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
-cfg.update({"workdir": str(TMP),
+cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
+            "workdir": str(TMP),
             "claude_cmd": [sys.executable, str(ROOT / "tests" / "stub_claude.py")],
             "instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
             "owner_uin": 0, "panel_port": 3097, "db_path": str(DB)})
