@@ -31,6 +31,7 @@ from websockets.asyncio.client import connect
 
 import sandbox
 import memory
+import context as context_mod
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
 from metrics import METRICS
@@ -114,6 +115,12 @@ PUBLIC_SYSTEM = str(CFG.get("public_system_prompt") or """你是一个 QQ 聊天
 - 语气自然、简短、口语化；QQ 不渲染 Markdown，不用标题、表格和长列表。
 - 不知道就承认不知道，不编造实时信息。""")
 PUBLIC_TEMPLATE = str(CFG.get("public_prompt_template") or "{task}")
+
+# 自动读上下文：回复前拉最近若干条消息压成摘录（群聊拉群历史，私聊拉对方历史）
+CONTEXT_ENABLED = bool(CFG.get("context_enabled", True))
+CONTEXT_MESSAGES = int(CFG.get("context_messages", 12))
+CONTEXT_MAX_CHARS = int(CFG.get("context_max_chars", 1200))
+CONTEXT_PER_MESSAGE = int(CFG.get("context_per_message", 80))
 # 盯梢：长时间没有任何输出就提示/中止，避免"卡住没人知道"
 STALL_WARN_SEC = int(CFG.get("stall_warn_seconds", 90))
 STALL_KILL_SEC = int(CFG.get("stall_kill_seconds", 300))
@@ -188,11 +195,11 @@ def set_session(kind: str, sid: str, scope: str = ""):
     save_state()
 
 
-def build_prompt(kind: str, text: str) -> str:
+def build_prompt(kind: str, text: str, history: str = "") -> str:
     """按通道套提示词。用 replace 不用 format：人格文本里出现花括号也不会炸。
 
-    闲聊通道会额外注入长期记忆（bridge/memory.md），任务通道不注入——
-    任务要的是指令清晰，记忆里那些"爱吃辣"之类会分散注意力。
+    闲聊通道会注入长期记忆和最近对话摘录；任务通道只给指令——
+    任务要的是清晰，历史和"爱吃辣"这类信息会分散注意力。
     """
     tpl = CHAT_TEMPLATE if kind == "chat" else TASK_TEMPLATE
     core = tpl.replace("{task}", text) if tpl else text
@@ -212,6 +219,9 @@ def build_prompt(kind: str, text: str) -> str:
         if persona_in_core:
             return core + "\n\n" + block
         parts.append(block)
+    if history:
+        parts.append("（最近的对话，供理解上下文，不要逐条复述；最后一条是刚说的：\n"
+                     + history + "）")
     parts.append(core)
     return "\n\n".join(parts)
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
@@ -702,7 +712,11 @@ async def _execute(row, cwd):
     text = row["text"]
     kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
     started = time.time()
-    prompt = build_prompt(kind, text)
+    # 闲聊没有历史会话时（刚重启/刚超限重置），拉最近私聊给模型接上话
+    history = ""
+    if kind == "chat" and CONTEXT_ENABLED and not get_session("chat"):
+        history = await fetch_history(user_id=STATE.get("owner_uin") or None)
+    prompt = build_prompt(kind, text, history=history)
     STATE["current_task"] = text
     save_state()
     sync_gauges()
@@ -874,6 +888,32 @@ def _group_text(data, self_id):
     return text.strip(), at_me
 
 
+async def fetch_history(group_id=None, user_id=None) -> str:
+    """拉最近消息并压成摘录；失败返回空串（不能因为拉历史失败就不回话）。"""
+    if not CONTEXT_ENABLED or CLIENT is None:
+        return ""
+    if group_id:
+        action = "get_group_msg_history"
+        params = {"group_id": int(group_id), "count": CONTEXT_MESSAGES}
+    elif user_id:
+        action = "get_friend_msg_history"
+        params = {"user_id": int(user_id), "count": CONTEXT_MESSAGES}
+    else:
+        return ""
+    try:
+        resp = await CLIENT.call(action, params, timeout=15)
+    except Exception as e:
+        logger.warning("拉上下文失败（%s）：%r", action, e)
+        return ""
+    data = resp.get("data")
+    msgs = data.get("messages") if isinstance(data, dict) else data
+    if not msgs:
+        return ""
+    return context_mod.format_transcript(
+        msgs, self_id=int(CFG.get("bot_uin") or 0), limit=CONTEXT_MESSAGES,
+        per_message=CONTEXT_PER_MESSAGE, max_chars=CONTEXT_MAX_CHARS)
+
+
 async def handle_public(scope: str, target_type: str, target_id: int, text: str,
                         who: str = ""):
     """公开聊天的一次问答：限流 → 串行执行（无工具）→ 发回原会话。"""
@@ -893,12 +933,18 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
     started = time.time()
     audit(AUDIT_PATH, event="public_message", scope=scope, who=who, text=text[:300])
     log(f"公开聊天 [{scope}] {who}：{text[:80]}")
+    history = await fetch_history(
+        group_id=target_id if target_type == "group" else None,
+        user_id=target_id if target_type == "private" else None)
+    prompt = PUBLIC_TEMPLATE.replace("{task}", text)
+    if history:
+        prompt = ("以下是这个会话最近的消息（供你理解上下文，不要逐条复述；"
+                  "最后一条是对方刚说的）：\n" + history + "\n\n" + prompt)
     try:
         # 串行：同一时间只跑一次公开聊天，避免消息多时把机器和额度一起打满
         async with PUBLIC_SEM:
             ok, reply, cost, code, tin, tout, err = await run_claude(
-                PUBLIC_TEMPLATE.replace("{task}", text), tid, str(PUBLIC_WORKDIR),
-                kind="public", scope=scope)
+                prompt, tid, str(PUBLIC_WORKDIR), kind="public", scope=scope)
     except Exception as e:
         logger.exception("public chat error")
         ok, reply, tin, tout, err = False, "", 0, 0, "exception"

@@ -39,6 +39,12 @@ LOG_DIR.mkdir(exist_ok=True)
 
 OWNER, SELF, STRANGER, GROUP = 12345, 999, 54321, 5555
 
+# 上下文接口的假数据：桥会在回复前拉最近消息
+GROUP_HISTORY = [{"user_id": 22222, "sender": {"user_id": 22222, "nickname": "老王"},
+                  "message": [{"type": "text", "data": {"text": "昨天羽毛球输了"}}]}]
+FRIEND_HISTORY = [{"user_id": STRANGER, "sender": {"user_id": STRANGER, "nickname": "路人"},
+                   "message": [{"type": "text", "data": {"text": "我叫小明"}}]}]
+
 base_name = "config.json" if (ROOT / "bridge" / "config.json").exists() else "config.example.json"
 cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
 cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
@@ -107,6 +113,11 @@ async def handler(ws):
         async for raw in ws:
             d = json.loads(raw)
             action, params = d.get("action"), d.get("params") or {}
+            data = {}
+            if action == "get_group_msg_history":
+                data = {"messages": GROUP_HISTORY}
+            elif action == "get_friend_msg_history":
+                data = {"messages": FRIEND_HISTORY}
             if action == "send_private_msg":
                 msg = params.get("message", "")
                 if int(params.get("user_id") or 0) == OWNER:
@@ -122,7 +133,7 @@ async def handler(ws):
                 FRIEND_ACTIONS.append(dict(params))
                 print(f"[好友申请处理] {params}", flush=True)
             if d.get("echo") is not None:
-                await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": {},
+                await ws.send(json.dumps({"status": "ok", "retcode": 0, "data": data,
                                           "echo": d["echo"]}, ensure_ascii=False))
 
     async def send(evt, note=""):
@@ -252,6 +263,9 @@ check(any(msg.startswith("stub-ok") for _, msg in GROUP_REPLIES), "带文字的 
 check(any("直接说" in msg for _, msg in GROUP_REPLIES), "只 @ 不说话应回一句提示")
 check(all(gid == GROUP for gid, _ in GROUP_REPLIES), "群回复应发回原群")
 check(not any("人格设定" in msg for _, msg in GROUP_REPLIES), "群回复不能带主人的人格")
+# 上下文：回复前会拉历史，摘录应出现在提示词里（stub 回显前 40 字）
+check(any("上下文" in msg for _, msg in GROUP_REPLIES), "群聊回复应自动带上最近对话摘录")
+check(any("上下文" in msg for _, msg in PUBLIC_REPLIES), "陌生私聊回复应自动带上最近对话摘录")
 
 # 好友申请：陌生人不动，主人同意
 check(len(FRIEND_ACTIONS) == 1, f"只应处理主人的好友申请，实际 {FRIEND_ACTIONS}")

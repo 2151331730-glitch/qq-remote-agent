@@ -413,3 +413,28 @@
 
 群消息事件是否真的进桥：重启后让主人在群里再 @ 一次，看 `日志里有没有"群消息 [group:…]"`。
 若没有，下一步查 NapCat 的群事件上报配置（当前 `messagePostFormat=array`、`reportSelfMessage=false`）。
+
+## 2026-10-24 23:50 自动读取上下文（最近对话摘录）
+
+### 做了什么
+
+- 新模块 `bridge/context.py`：`format_transcript()` 把最近消息压成 `昵称: 内容`，
+  限制三条：最近 12 条（`context_messages`）、每条 80 字（`context_per_message`）、
+  总长 1200 字（`context_max_chars`），超长时从最旧的整行丢。
+- 拉取：群聊用 `get_group_msg_history`，私聊用 `get_friend_msg_history`；
+  失败只打 warning，照常回复，绝不因为拉历史卡住聊天。
+- 注入：公开聊天每次回复都带"最近对话"块；主人闲聊只在**没有 resume 会话**
+  （刚重启/超限重置）时带，有会话时不重复喂历史。
+- 兼容 array 分段和 CQ 码字符串；图片/表情压成 `[图片]`、`[表情]`，@ 压成 `@QQ号`。
+- 配置：`context_enabled` / `context_messages` / `context_max_chars` / `context_per_message`。
+
+### 验证
+
+- `pytest` → 112 passed, 12 skipped（新增 `test_context.py` 7 项、提示词顺序 2 项）。
+- 端到端：mock 的 OneBot 现在会响应两个 history 接口，断言群聊/陌生私聊回复里都带上了
+  "上下文"字样（stub 回显提示词前 40 字，说明摘录真的进了提示词）。全部通过。
+
+### 注意
+
+- 上下文只拉**当前会话**：群里拉这个群，私聊拉和这个人，不跨会话。
+- 每次公开回复多约 1k 字符输入；嫌贵调小 `context_messages` 或关掉。

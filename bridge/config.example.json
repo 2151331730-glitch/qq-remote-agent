@@ -35,6 +35,10 @@
   "public_workdir": "",
   "group_trigger_prefix": "",
   "public_system_prompt": "",
+  "context_enabled": true,
+  "context_messages": 12,
+  "context_max_chars": 1200,
+  "context_per_message": 80,
   "stream_text": true,
   "stream_text_min_chars": 80,
   "stream_text_interval": 1.5

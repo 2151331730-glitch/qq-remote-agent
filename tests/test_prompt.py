@@ -54,3 +54,16 @@ def test_chat_prompt_injects_persona_then_memory_then_text(tmp_path, monkeypatch
     assert p.index("PERSONA-X") < p.index("该用户喜欢喝美式") < p.index("在吗")
     # 标题行不应该被塞进提示词，白花 token
     assert "标题行" not in p
+
+
+def test_chat_prompt_includes_history_before_text(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    p = b.build_prompt("chat", "在吗", history="甲: 晚上吃啥")
+    assert "甲: 晚上吃啥" in p
+    assert p.index("甲: 晚上吃啥") < p.index("在吗")
+
+
+def test_task_prompt_ignores_history(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    p = b.build_prompt("task", "帮我列目录", history="甲: 晚上吃啥")
+    assert p == "任务：帮我列目录"
