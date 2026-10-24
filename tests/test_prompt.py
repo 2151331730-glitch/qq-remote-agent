@@ -82,3 +82,24 @@ def test_public_system_falls_back_when_file_missing(tmp_path, monkeypatch):
     b.PUBLIC_PERSONA_PATH = tmp_path / "missing.md"
     text = b.load_public_system()
     assert "只能聊天" in text and "PUBLIC-PERSONA" not in text
+
+
+def test_should_reset_chat_session_before_running(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    b.STATE["chat_session_id"] = "s1"
+    b.STATE["chat_last_tokens_in"] = b.CHAT_SESSION_LIMIT + 1
+    assert b.should_reset_session("chat") is True
+    b.STATE["chat_last_tokens_in"] = 100
+    assert b.should_reset_session("chat") is False
+    b.STATE["chat_session_id"] = ""
+    assert b.should_reset_session("chat") is False
+
+
+def test_reload_config_hot_updates_group_policy(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    cfg = json.loads(b.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg["group_policy"] = 0.3
+    b.CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    info = b.reload_config()
+    assert info["group_policy"] == 0.3
+    assert b.GROUP_POLICY == 0.3

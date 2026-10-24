@@ -73,6 +73,12 @@ MAX_QUEUE = int(CFG.get("max_queue", 5))
 # 单次任务输入 token 超过这个数就自动开新会话：--resume 会把整段历史重发一遍，
 # 会话越长每轮越贵，实测聊久了单次能到 200k token。
 SESSION_TOKEN_LIMIT = int(CFG.get("session_token_limit", 120000))
+# 闲聊单独的低阈值：聊天对"精确记忆"要求低，但每次都要重发历史，30k 以上就该换新
+CHAT_SESSION_LIMIT = int(CFG.get("chat_session_token_limit", 30000))
+# 闲聊单次预算上限（CLI 估算美元）：防止一句"多说点话"跑几十轮工具烧钱
+CHAT_MAX_BUDGET = float(CFG.get("chat_max_budget_usd", 0.12))
+# 闲聊慢的时候给个回音，别让人以为死了
+CHAT_SLOW_NOTE_SEC = int(CFG.get("chat_slow_note_seconds", 45))
 # 额度：防账号被盗后被无限刷（0 = 不限制）
 MAX_TASKS_PER_HOUR = int(CFG.get("max_tasks_per_hour", 30))
 MAX_TOKENS_PER_DAY = int(CFG.get("max_tokens_per_day", 2_000_000))
@@ -225,6 +231,15 @@ def set_session(kind: str, sid: str, scope: str = ""):
     save_state()
 
 
+def session_limit(kind: str) -> int:
+    return CHAT_SESSION_LIMIT if kind == "chat" else SESSION_TOKEN_LIMIT
+
+
+def should_reset_session(kind: str) -> bool:
+    """跑之前先看上一轮的输入量：到阈值就换新会话，别等付完钱再重置。"""
+    return bool(get_session(kind)) and STATE.get(tokens_key(kind), 0) > session_limit(kind)
+
+
 def build_prompt(kind: str, text: str, history: str = "") -> str:
     """按通道套提示词。用 replace 不用 format：人格文本里出现花括号也不会炸。
 
@@ -254,6 +269,46 @@ def build_prompt(kind: str, text: str, history: str = "") -> str:
                      + history + "）")
     parts.append(core)
     return "\n\n".join(parts)
+
+
+def reload_config() -> dict:
+    """重读 config.json，热更新运行中可改的旋钮（路径/端口这类进程级设置不重载）。
+
+    为什么需要：模型或用户改了群策略，不加这个就只能重启 bridge；
+    而重启会把正在跑的回复打断（曾经因此让用户以为"私聊没反应"）。
+    """
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    CFG.clear()
+    CFG.update(data)
+    g = globals()
+    g["GROUP_PREFIX"] = str(CFG.get("group_trigger_prefix") or "")
+    g["GROUP_POLICY"] = CFG.get("group_policy", "mention")
+    g["GROUP_POLICY_OVERRIDES"] = dict(CFG.get("group_policy_overrides") or {})
+    g["GROUP_MIN_CHARS"] = int(CFG.get("group_min_chars", 4))
+    g["PUBLIC_ENABLED"] = bool(CFG.get("public_chat", True))
+    g["PUBLIC_MAX_PER_HOUR"] = int(CFG.get("public_max_per_hour", 20))
+    g["PUBLIC_COOLDOWN"] = float(CFG.get("public_cooldown_seconds", 5))
+    g["PUBLIC_MAX_REPLY"] = int(CFG.get("public_max_reply_chars", 400))
+    g["PUBLIC_MAX_INPUT"] = int(CFG.get("public_max_input_chars", 1000))
+    g["PUBLIC_MAX_PENDING"] = int(CFG.get("public_max_pending", 3))
+    g["CONTEXT_ENABLED"] = bool(CFG.get("context_enabled", True))
+    g["CONTEXT_MESSAGES"] = int(CFG.get("context_messages", 12))
+    g["CONTEXT_MAX_CHARS"] = int(CFG.get("context_max_chars", 1200))
+    g["CONTEXT_PER_MESSAGE"] = int(CFG.get("context_per_message", 80))
+    g["SESSION_TOKEN_LIMIT"] = int(CFG.get("session_token_limit", 120000))
+    g["CHAT_SESSION_LIMIT"] = int(CFG.get("chat_session_token_limit", 30000))
+    g["CHAT_MAX_BUDGET"] = float(CFG.get("chat_max_budget_usd", 0.12))
+    g["CHAT_SLOW_NOTE_SEC"] = int(CFG.get("chat_slow_note_seconds", 45))
+    g["SHOW_FOOTER"] = bool(CFG.get("show_footer", False))
+    g["MODEL"] = CFG.get("model") or ""
+    g["CHAT_TEMPLATE"] = str(CFG.get("chat_prompt_template") or "")
+    g["TASK_TEMPLATE"] = str(
+        CFG.get("task_prompt_template") or CFG.get("prompt_template")
+        or "（手机 QQ 发来的任务，直接在本机执行）{task}\n"
+           "做完用纯文本给一句结论，别用 Markdown 标题和表格。")
+    g["PERSONA"] = _load_persona()
+    return {"group_policy": g["GROUP_POLICY"], "group_min_chars": g["GROUP_MIN_CHARS"]}
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
 STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
 if STORE_BACKEND == "redis":
@@ -551,6 +606,9 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                     args.append("--include-partial-messages")
             if MODEL:
                 args += ["--model", MODEL]
+            # 闲聊兜底预算：一句话触发的工具链不该烧掉一整个任务的钱
+            if kind == "chat" and CHAT_MAX_BUDGET > 0:
+                args += ["--max-budget-usd", f"{CHAT_MAX_BUDGET:.2f}"]
             if use_resume and use_session and session:
                 args += ["--resume", session]
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", WSL_UTF8="1")
@@ -742,6 +800,12 @@ async def _execute(row, cwd):
     text = row["text"]
     kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
     started = time.time()
+    # 跑之前先看会话是不是已经太贵：到阈值就换新，别等付完 55 万 token 再重置
+    if kind in ("task", "chat") and should_reset_session(kind):
+        _old = STATE.get(tokens_key(kind), 0)
+        set_session(kind, "")
+        STATE[tokens_key(kind)] = 0
+        log(f"会话换新（{kind}）：上一轮输入 {_old} token 超过 {session_limit(kind)}")
     # 闲聊没有历史会话时（刚重启/刚超限重置），拉最近私聊给模型接上话
     history_text = ""
     if kind == "chat" and CONTEXT_ENABLED and not get_session("chat"):
@@ -759,10 +823,13 @@ async def _execute(row, cwd):
         # 进度也进发件箱：断线时不丢
         await deliver(f"🔧 {msg}", tid)
 
+    streamed = {"v": False}
+
     async def _text(chunk):
         # 逐字流式：像 TUI 那样边生成边显示（已按字数和时间合并，避免刷屏）
         txt = _plain(chunk)
         if txt:
+            streamed["v"] = True
             await deliver(txt, tid)
 
     run_task = asyncio.create_task(run_claude(
@@ -772,6 +839,14 @@ async def _execute(row, cwd):
         on_text=_text, kind=kind))
     RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd,
                     "kind": kind}
+
+    async def _slow_note():
+        """闲聊超过一段时间还没吐字，给个回音，避免"看着像死了"。"""
+        await asyncio.sleep(CHAT_SLOW_NOTE_SEC)
+        if not run_task.done() and not streamed["v"]:
+            await deliver("嗯…等我一下", tid)
+
+    slow = asyncio.create_task(_slow_note()) if kind == "chat" else None
     # 闲聊要快，不发"还在执行"心跳
     hb = asyncio.create_task(heartbeat(tid, started)) if kind != "chat" else None
     cost, tin, tout, err_kind = 0.0, 0, 0, "ok"
@@ -792,6 +867,8 @@ async def _execute(row, cwd):
     finally:
         if hb:
             hb.cancel()
+        if slow:
+            slow.cancel()
 
     seconds = time.time() - started
     state = "succeeded" if ok else "failed"
@@ -824,7 +901,7 @@ async def _execute(row, cwd):
     else:
         footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok" if SHOW_FOOTER else ""
         await deliver(("✅ " if ok else "⚠️ ") + body + footer, tid)
-    if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and get_session(kind):
+    if WORKERS == 1 and tin > session_limit(kind) and get_session(kind):
         STATE[session_key(kind)] = ""
         STATE[tokens_key(kind)] = 0
         save_state()
@@ -1116,6 +1193,7 @@ HELP = """命令：
 /确认 执行待确认的危险操作
 /取消 放弃待确认的操作（/取消 <ID> = 取消排队中的某条）
 /新会话 清空对话上下文（闲聊和任务都清）
+/重载 改完 config.json 不用重启，重读配置
 /记住 <内容> 记进长期记忆（例：/记住 周三下午有课）
 /记忆 看长期记忆里记了什么
 /提醒 20:30 交作业 到点提醒（也支持 明天 8:00 / 10-25 20:30 / +10m）
@@ -1319,6 +1397,17 @@ async def handle_command(text: str) -> bool:
         STATE["chat_session_id"] = ""
         save_state()
         await send("🧹 已开新会话（闲聊和任务都清空了）。")
+        return True
+
+    if low in ("/重载", "/reload"):
+        try:
+            info = reload_config()
+        except Exception as e:
+            await send(f"⚠️ 重载失败：{e}")
+            return True
+        log("配置已重载")
+        await send(f"🔄 配置已重载（群策略 {info['group_policy']}，"
+                   f"最短 {info['group_min_chars']} 字）")
         return True
 
     if low in ("/心跳", "/ping"):
@@ -1795,7 +1884,7 @@ async def main():
     STATE["current_task"] = ""
     # 上次会话已经很贵了就别继续接力，直接开新的（闲聊/任务各算各的）
     for _kind in ("task", "chat"):
-        if STATE.get(tokens_key(_kind), 0) > SESSION_TOKEN_LIMIT and STATE.get(session_key(_kind)):
+        if STATE.get(tokens_key(_kind), 0) > session_limit(_kind) and STATE.get(session_key(_kind)):
             log(f"启动时放弃旧会话（{_kind}，上次输入 {STATE[tokens_key(_kind)]} token 超限）")
             STATE[session_key(_kind)] = ""
             STATE[tokens_key(_kind)] = 0

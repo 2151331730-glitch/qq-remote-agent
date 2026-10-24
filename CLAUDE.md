@@ -144,6 +144,10 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 - 状态机：`queued → running → succeeded | failed | cancelled | interrupted`，只有 `queued` 能被 `/取消 <ID>`。
 - 通道：`tasks.kind` = `task`（执行语义 + `session_id`）或 `chat`（闲聊 + `chat_session_id`）；
   分流在 `on_message` 里由 `intent.classify()` 决定，`/执行`、`/聊` 可覆盖；闲聊不转发 🔧、不发心跳、不回 📥。
+- 闲聊三道闸：`chat_session_token_limit`（默认 30000，**跑之前**就换会话）、
+  `chat_max_budget_usd`（默认 0.12，传 `--max-budget-usd`）、
+  `chat_slow_note_seconds`（45 秒没吐字先回一句）。任务仍用 `session_token_limit`（120k）且运行后才重置。
+- 配置热更新：`/重载` 重读 config.json，更新群策略、限额、模板与人格；端口/路径类设置仍需重启。
 - 提醒：`reminders.db` 独立库，`reminder_loop` 每 20 秒扫到点项，走发件箱发送；`sent_at` 标记后不重发。
 - 幂等：`dedup_key = qq:<message_id>` 有唯一索引，重复投递直接丢弃（`store.enqueue` 返回 `dup=True`）。
 - 崩溃恢复：启动时 `recover_interrupted()` 把残留 `running` 标成 `interrupted`，并在连上 QQ 后主动通知。
