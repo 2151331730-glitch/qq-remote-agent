@@ -48,6 +48,16 @@ def ev(text, mid=None):
 
 async def handler(ws):
     print("[mock] 桥已连接", flush=True)
+    # 等看板就绪：CI 上冷启动慢，太早提交会全部失败
+    import urllib.request
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{cfg['panel_port']}/api/state",
+                                   timeout=1).read()
+            print("[mock] 看板就绪", flush=True)
+            break
+        except Exception:
+            await asyncio.sleep(0.5)
 
     async def receiver():
         async for raw in ws:
@@ -83,8 +93,10 @@ async def main():
         print("[mock] 服务已起 3002", flush=True)
         env = dict(os.environ, QQ_REMOTE_CONFIG=str(CONFIG), QQ_REMOTE_STATE=str(STATE),
                    QQ_REMOTE_DB=str(DB))
+        bridge_log = open(TMP / "bridge-stdout.log", "w", encoding="utf-8")
         bridge = subprocess.Popen([sys.executable, str(ROOT / "bridge" / "bridge.py")],
-                                  cwd=str(ROOT / "bridge"), env=env)
+                                  cwd=str(ROOT / "bridge"), env=env,
+                                  stdout=bridge_log, stderr=subprocess.STDOUT)
         await asyncio.sleep(38)
         bridge.terminate()
         try:
@@ -103,6 +115,12 @@ for row in c.execute("SELECT id, state, source, substr(text,1,24) FROM tasks ORD
 
 # ---- 断言（CI 用）：幂等 + 执行成功 ----
 rows = list(c.execute("SELECT id, state, tokens_in FROM tasks"))
+if not rows:
+    print("\n=== 桥 stdout/日志（排查用）===")
+    for f in (TMP / "bridge-stdout.log", LOG_DIR / "bridge.log"):
+        if f.exists():
+            print(f"--- {f} ---")
+            print(f.read_text(encoding="utf-8", errors="replace")[-2000:])
 assert len(rows) == 1, f"期望 1 条任务（重复投递应被幂等丢弃），实际 {len(rows)}"
 assert rows[0][1] == "succeeded", f"任务状态应为 succeeded，实际 {rows[0][1]}"
 print("\n✅ 断言通过：1 条任务、succeeded、重复投递被丢弃")
