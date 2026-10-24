@@ -25,5 +25,8 @@ bridge/config.json
 
 # 压测/监控下载的大件
 tools/redis/
-tools/monitor/
+tools/monitor/*
+!tools/monitor/prometheus.yml
+!tools/monitor/dashboards/
+!tools/monitor/start-monitoring.ps1
 docs/bench/*.json

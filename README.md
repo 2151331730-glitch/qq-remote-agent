@@ -54,14 +54,22 @@ powershell -ExecutionPolicy Bypass -File 自检.ps1
 
 `/状态` `/任务 [n]` `/停止` `/取消 <ID>` `/清空` `/确认` `/取消` `/新会话` `/日志 [n]` `/全文` `/cd <路径>` `/心跳`，以及 `!<PowerShell 命令>` 直接执行。
 
-## 指标
+## 指标与看板
 
 ```
 curl http://127.0.0.1:3099/metrics
 qq_remote_tasks_total{state="succeeded"} 12
 qq_remote_task_duration_seconds_bucket{le="30"} 11
 qq_remote_queue_depth 0
+qq_remote_tokens_total{direction="in"} 205459
 ```
+
+接 Prometheus + Grafana（本机已装，`tools/monitor/start-monitoring.ps1` 一键起）：
+
+![Grafana 看板](docs/grafana-dashboard.png)
+
+面板包含：队列深度、执行中、任务总数、token 用量、任务速率（按状态）、p95 耗时、队列曲线、token 速率。
+Prometheus 每 5 秒抓一次 `/metrics`；Grafana 用 provisioning 文件自动装配数据源与仪表盘，不用手工点。
 
 ## 测试
 

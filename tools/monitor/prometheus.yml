@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: qq-remote
+    static_configs:
+      - targets: ["127.0.0.1:3099"]
+    metrics_path: /metrics
+
+  - job_name: qq-remote-stub
+    static_configs:
+      - targets: ["127.0.0.1:3096"]
+    metrics_path: /metrics
