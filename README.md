@@ -30,6 +30,12 @@
 | 想横向扩、多台机器一起消费 | `store_backend=redis`：两个进程共享队列，Lua 原子 claim，实测 40 条任务 20/20 分摊、零重复 |
 | 一条命令把整台机器搞坏 | `!!` 前缀走沙箱后端（Docker/WSL），只挂载当前目录；边界写在 `ARCHITECTURE.md` |
 | 不知道能扛多少 | `docs/benchmarks.md`：4 worker 跨目录 3.6 倍吞吐，同目录刻意不加速 |
+| NapCat 断一下，结果就丢了 | **发件箱**：结果先落库再发送，重连后自动补发未送达的消息 |
+| 长任务只有"还在执行" | **流式进度**：`stream-json` 解析工具调用，转发成 `🔧 PowerShell: …`（默认 15 秒一条） |
+| 失败了不知道哪种失败 | 错误分类 `timeout / parse / cli_error / exception`，进库也进 `qq_remote_task_errors_total{kind}` |
+| 号被盗会被无限刷 | 额度：每小时任务数上限 + 每日 token 上限，超限直接拒绝 |
+| 数据只增不减 | 30 天保留策略（任务/事件/已送达发件箱），定期清理 + VACUUM |
+| 守护只看进程在不在 | 改为探测 3001 监听 + 桥的 ESTABLISHED 连接；连续 3 次异常才重启 |
 
 ## 快速开始
 

@@ -199,3 +199,19 @@
 - Grafana 13 首启要从 catalog 装 datasource 插件，不挂代理会失败（Plugin not registered）
   → 用 HTTP(S)_PROXY 起进程后正常
 - provisioning 自动装配数据源与 8 面板仪表盘；截图存 docs/grafana-dashboard.png
+
+### 2026-10-24 19:00-19:05 可靠性七件套
+
+1. **发件箱**（store/outbox）：结果先落库再发，重连补发；实测断线不丢
+2. **守护健康探测**：不再只看进程，改为 3001 监听 + 桥的 ESTABLISHED 连接，连续 3 次异常才动作
+3. **错误分类**：timeout / parse / cli_error / exception / spawn，入 `error_kind` 列 + `qq_remote_task_errors_total{kind}`（补上了之前只声明不打点的死指标）
+4. **保留策略**：30 天清理 + VACUUM；审计轮转从"覆盖 .1"改成带时间戳文件名
+5. **额度**：每小时任务数 + 每日 token，超限直接拒绝（防号被盗刷）
+6. **流式进度**：`--output-format stream-json`，工具调用转成 `🔧 PowerShell: …`，默认 15 秒一条；实测发件箱里能看到
+7. **单实例锁**：bind 127.0.0.1:30991，第二实例直接退出
+
+**事故**：我自己用 `start-all.ps1 -Once` 做验证时，非管理员读不到管理员进程的命令行，
+被误判为"桥没跑"并起了第二个实例（两个进程共享 state.json）。已修：判断改为看 TCP 连接，
+并加单实例锁兜底。这条也说明守护脚本必须在管理员权限下跑（计划任务里是，手工验证要注意）。
+
+**测试**：70 个（新增 outbox/额度/清理/流式/错误分类）。

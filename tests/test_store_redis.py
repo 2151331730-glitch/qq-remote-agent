@@ -108,3 +108,29 @@ def test_claim_is_atomic_across_clients(store):
     store.enqueue("only-one")
     got = [store.claim_next(), other.claim_next()]
     assert sum(1 for r in got if r) == 1
+
+
+def test_outbox_roundtrip(store):
+    oid = store.outbox_add("hello", "t1")
+    pend = store.outbox_pending(5)
+    assert len(pend) == 1 and pend[0]["body"] == "hello"
+    store.outbox_mark(oid, True)
+    assert store.outbox_pending(5) == []
+
+
+def test_quota_counters(store):
+    tid, _ = store.enqueue("x")
+    store.claim_next()
+    store.finish(tid, "succeeded", tokens_in=50, tokens_out=5)
+    assert store.count_since(3600) == 1
+    assert store.tokens_since(86400) == 55
+
+
+def test_prune_removes_finished(store):
+    import time as _t
+    tid, _ = store.enqueue("old")
+    store.claim_next()
+    store.finish(tid, "succeeded")
+    store.r.zadd(store._k("finished"), {tid: _t.time() - 40 * 86400})
+    assert store.prune(30) == 1
+    assert store.get(tid) is None

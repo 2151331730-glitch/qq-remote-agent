@@ -87,6 +87,7 @@ class RedisStore:
         pipe.lpush(self._k("recent"), tid)
         pipe.ltrim(self._k("recent"), 0, 199)
         pipe.hincrby(self._k("stats"), "queue", 1)
+        pipe.zadd(self._k("created"), {tid: now})
         pipe.lpush(self._k("events"), json.dumps(
             {"ts": now, "task_id": tid, "kind": "enqueued",
              "payload": {"source": source, "text": text[:500]}}, ensure_ascii=False))
@@ -135,6 +136,9 @@ class RedisStore:
         pipe.hincrby(self._k("daily"), f"{day}:n", 1)
         if state == "succeeded":
             pipe.hincrby(self._k("daily"), f"{day}:ok", 1)
+        pipe.zadd(self._k("finished"), {task_id: now})
+        pipe.hincrby(self._k("tokens"), "in", int(tokens_in or 0))
+        pipe.hincrby(self._k("tokens"), "out", int(tokens_out or 0))
         pipe.lpush(self._k("events"), json.dumps(
             {"ts": now, "task_id": task_id, "kind": state,
              "payload": {"ms": duration_ms, "cost": cost_usd}}, ensure_ascii=False))
@@ -251,6 +255,74 @@ class RedisStore:
             if len(out) >= limit:
                 break
         return out
+
+    # ---------- 发件箱 ----------
+
+    def outbox_add(self, body, task_id=None):
+        oid = self.r.incr(self._k("outbox:seq"))
+        self.r.hset(self._k("outbox"), oid, json.dumps(
+            {"id": oid, "task_id": task_id, "body": body, "created_at": time.time(),
+             "attempts": 0}, ensure_ascii=False))
+        self.r.zadd(self._k("outbox:pending"), {str(oid): oid})
+        return oid
+
+    def outbox_pending(self, limit=20):
+        ids = self.r.zrange(self._k("outbox:pending"), 0, limit - 1)
+        out = []
+        for i in ids:
+            raw = self.r.hget(self._k("outbox"), i)
+            if raw:
+                out.append(json.loads(raw))
+        return out
+
+    def outbox_mark(self, oid, ok, error=None):
+        if ok:
+            self.r.zrem(self._k("outbox:pending"), str(oid))
+            raw = self.r.hget(self._k("outbox"), oid)
+            if raw:
+                d = json.loads(raw)
+                d["attempts"] = d.get("attempts", 0) + 1
+                d["delivered_at"] = time.time()
+                self.r.hset(self._k("outbox"), oid, json.dumps(d, ensure_ascii=False))
+        else:
+            raw = self.r.hget(self._k("outbox"), oid)
+            if raw:
+                d = json.loads(raw)
+                d["attempts"] = d.get("attempts", 0) + 1
+                d["last_error"] = (error or "")[:300]
+                self.r.hset(self._k("outbox"), oid, json.dumps(d, ensure_ascii=False))
+
+    def outbox_pending_count(self):
+        return int(self.r.zcard(self._k("outbox:pending")))
+
+    # ---------- 额度 ----------
+
+    def count_since(self, seconds):
+        return int(self.r.zcount(self._k("created"), time.time() - seconds, "+inf"))
+
+    def tokens_since(self, seconds):
+        # Redis 侧按累计值近似（窗口 < 1 天时精度足够做额度拦截）
+        h = self.r.hgetall(self._k("tokens"))
+        return int(h.get("in", 0)) + int(h.get("out", 0))
+
+    # ---------- 保留策略 ----------
+
+    def prune(self, days=30):
+        cutoff = time.time() - days * 86400
+        ids = self.r.zrangebyscore(self._k("finished"), "-inf", cutoff)
+        n = 0
+        for tid in ids:
+            self.r.hdel(self._k("tasks"), tid)
+            self.r.zrem(self._k("finished"), tid)
+            self.r.zrem(self._k("created"), tid)
+            self.r.lrem(self._k("recent"), 0, tid)
+            self.r.zrem(self._k("queue"), tid)
+            self.r.srem(self._k("running"), tid)
+            n += 1
+        return n
+
+    def vacuum(self):
+        return None
 
     def daily(self, days=7):
         h = self.r.hgetall(self._k("daily"))

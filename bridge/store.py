@@ -42,8 +42,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     tokens_in   INTEGER NOT NULL DEFAULT 0,
     tokens_out  INTEGER NOT NULL DEFAULT 0,
     result      TEXT,
-    error       TEXT
+    error       TEXT,
+    error_kind  TEXT
 );
+
+-- 发件箱：结果先落库再发送，发送失败可在重连后补发（不会因为 NapCat 掉线丢结果）
+CREATE TABLE IF NOT EXISTS outbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     TEXT,
+    created_at  REAL NOT NULL,
+    body        TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    last_error  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(delivered_at, id);
 CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(state, priority DESC, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
 
@@ -73,7 +86,8 @@ class TaskStore:
         """轻量迁移：老库缺列就补上（CREATE TABLE IF NOT EXISTS 不会改已存在的表）。"""
         cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
         for name, ddl in (("tokens_in", "ALTER TABLE tasks ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"),
-                          ("tokens_out", "ALTER TABLE tasks ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")):
+                          ("tokens_out", "ALTER TABLE tasks ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0"),
+                          ("error_kind", "ALTER TABLE tasks ADD COLUMN error_kind TEXT")):
             if name not in cols:
                 c.execute(ddl)
 
@@ -137,7 +151,7 @@ class TaskStore:
                       (task_id,))
 
     def finish(self, task_id, state, result=None, error=None, exit_code=None,
-               cost_usd=0.0, duration_ms=None, tokens_in=0, tokens_out=0):
+               cost_usd=0.0, duration_ms=None, tokens_in=0, tokens_out=0, error_kind=None):
         assert state in TERMINAL, state
         now = time.time()
         with self._conn() as c:
@@ -147,10 +161,10 @@ class TaskStore:
             c.execute(
                 "UPDATE tasks SET state=?, finished_at=?, duration_ms=?, exit_code=?,"
                 " cost_usd=cost_usd+?, tokens_in=tokens_in+?, tokens_out=tokens_out+?,"
-                " result=?, error=? WHERE id=?",
+                " result=?, error=?, error_kind=? WHERE id=?",
                 (state, now, duration_ms, exit_code, cost_usd or 0,
                  int(tokens_in or 0), int(tokens_out or 0),
-                 (result or "")[:20000], (error or "")[:2000], task_id))
+                 (result or "")[:20000], (error or "")[:2000], error_kind, task_id))
             c.execute("INSERT INTO events(ts, task_id, kind, payload) VALUES(?,?,?,?)",
                       (now, task_id, state,
                        json.dumps({"ms": duration_ms, "cost": cost_usd}, ensure_ascii=False)))
@@ -250,6 +264,66 @@ class TaskStore:
             else:
                 rows = c.execute("SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,))
             return [dict(r) for r in rows]
+
+    # ---------- 发件箱（结果投递可靠性） ----------
+
+    def outbox_add(self, body, task_id=None):
+        with self._conn() as c:
+            cur = c.execute("INSERT INTO outbox(created_at, task_id, body) VALUES(?,?,?)",
+                            (time.time(), task_id, body))
+            return cur.lastrowid
+
+    def outbox_pending(self, limit=20):
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM outbox WHERE delivered_at IS NULL ORDER BY id LIMIT ?", (limit,))]
+
+    def outbox_mark(self, oid, ok, error=None):
+        with self._conn() as c:
+            if ok:
+                c.execute("UPDATE outbox SET delivered_at=?, attempts=attempts+1 WHERE id=?",
+                          (time.time(), oid))
+            else:
+                c.execute("UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
+                          ((error or "")[:300], oid))
+
+    def outbox_pending_count(self):
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) n FROM outbox WHERE delivered_at IS NULL").fetchone()["n"]
+
+    # ---------- 额度 ----------
+
+    def count_since(self, seconds):
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) n FROM tasks WHERE created_at>=?",
+                             (time.time() - seconds,)).fetchone()["n"]
+
+    def tokens_since(self, seconds):
+        with self._conn() as c:
+            return c.execute("SELECT COALESCE(SUM(tokens_in+tokens_out),0) v FROM tasks"
+                             " WHERE created_at>=?", (time.time() - seconds,)).fetchone()["v"]
+
+    # ---------- 保留策略 ----------
+
+    def prune(self, days=30):
+        """删掉过期的终态任务与事件；返回删除条数。"""
+        cutoff = time.time() - days * 86400
+        with self._conn() as c:
+            n1 = c.execute("DELETE FROM tasks WHERE state IN ('succeeded','failed','cancelled',"
+                           "'interrupted') AND COALESCE(finished_at, created_at)<?",
+                           (cutoff,)).rowcount
+            n2 = c.execute("DELETE FROM events WHERE ts<?", (cutoff,)).rowcount
+            n3 = c.execute("DELETE FROM outbox WHERE delivered_at IS NOT NULL AND delivered_at<?",
+                           (cutoff,)).rowcount
+            return n1 + n2 + n3
+
+    def vacuum(self):
+        try:
+            c = sqlite3.connect(self.path, timeout=10)
+            c.execute("VACUUM")
+            c.close()
+        except Exception:
+            pass
 
     def daily(self, days=7):
         since = time.time() - days * 86400

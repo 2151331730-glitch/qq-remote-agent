@@ -54,10 +54,15 @@ def danger_reason_shell(cmd: str):
 
 
 def audit(path: Path, **fields):
-    """追加一条审计记录；失败不影响主流程。超过 5MB 自动轮转一份。"""
+    """追加一条审计记录；失败不影响主流程。
+
+    超过 5MB 轮转成带时间戳的文件（`audit-20261024-183000.jsonl`），
+    早期版本是覆盖 `.1`，会把上一次的审计直接冲掉。
+    """
     try:
         if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
-            path.replace(path.with_suffix(path.suffix + ".1"))
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path.replace(path.with_name(f"{path.stem}-{stamp}{path.suffix}"))
         rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds")}
         rec.update(fields)
         with open(path, "a", encoding="utf-8") as f:

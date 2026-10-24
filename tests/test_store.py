@@ -138,3 +138,47 @@ def test_migration_adds_token_columns(tmp_path):
     row = s.get("old1")
     assert row["text"] == "历史任务"
     assert row["tokens_in"] == 0 and row["tokens_out"] == 0
+
+
+def test_outbox_lifecycle(store):
+    oid = store.outbox_add("结果文本", "task1")
+    pend = store.outbox_pending(10)
+    assert len(pend) == 1 and pend[0]["body"] == "结果文本"
+    store.outbox_mark(oid, True)
+    assert store.outbox_pending(10) == []
+    assert store.outbox_pending_count() == 0
+
+
+def test_outbox_failure_keeps_pending(store):
+    oid = store.outbox_add("x", None)
+    store.outbox_mark(oid, False, "boom")
+    pend = store.outbox_pending(10)
+    assert len(pend) == 1 and pend[0]["attempts"] == 1
+
+
+def test_count_and_tokens_since(store):
+    tid, _ = store.enqueue("x")
+    store.claim_next()
+    store.finish(tid, "succeeded", tokens_in=100, tokens_out=10)
+    assert store.count_since(3600) == 1
+    assert store.tokens_since(86400) == 110
+
+
+def test_prune_removes_old_terminal_tasks(store):
+    import time as _t
+    tid, _ = store.enqueue("old")
+    store.claim_next()
+    store.finish(tid, "succeeded", duration_ms=5)
+    # 把完成时间挪到 40 天前
+    with store._conn() as c:
+        c.execute("UPDATE tasks SET finished_at=? WHERE id=?", (_t.time() - 40 * 86400, tid))
+    assert store.prune(days=30) >= 1
+    # 记录被删掉了（stats 还能查到，因为它是聚合）
+    assert store.get(tid) is None
+
+
+def test_error_kind_saved(store):
+    tid, _ = store.enqueue("x")
+    store.claim_next()
+    store.finish(tid, "failed", error="boom", error_kind="timeout")
+    assert store.get(tid)["error_kind"] == "timeout"

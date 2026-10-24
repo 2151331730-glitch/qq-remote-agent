@@ -66,6 +66,13 @@ MAX_QUEUE = int(CFG.get("max_queue", 5))
 # 单次任务输入 token 超过这个数就自动开新会话：--resume 会把整段历史重发一遍，
 # 会话越长每轮越贵，实测聊久了单次能到 200k token。
 SESSION_TOKEN_LIMIT = int(CFG.get("session_token_limit", 120000))
+# 额度：防账号被盗后被无限刷（0 = 不限制）
+MAX_TASKS_PER_HOUR = int(CFG.get("max_tasks_per_hour", 30))
+MAX_TOKENS_PER_DAY = int(CFG.get("max_tokens_per_day", 2_000_000))
+RETENTION_DAYS = int(CFG.get("retention_days", 30))
+# 流式进度：把工具调用转发到 QQ，长任务不再只有"还在执行"
+STREAM_PROGRESS = bool(CFG.get("stream_progress", True))
+PROGRESS_MIN_INTERVAL = float(CFG.get("progress_min_interval", 15))
 WORKERS = max(1, int(CFG.get("workers", 1)))
 PANEL_PORT = int(CFG.get("panel_port", 3099))
 PANEL_TOKEN = str(CFG.get("panel_token", "") or "")
@@ -167,17 +174,34 @@ class Client:
 CLIENT: Client | None = None
 
 
-async def send(text: str):
-    """把长文本切成多条发出去。"""
+async def send(text: str) -> bool:
+    """把长文本切成多条发出去。返回是否全部送达。"""
     if not STATE["owner_uin"] or CLIENT is None:
         logger.warning("send skipped (no owner/client): %s", text[:80])
-        return
+        return False
     for part in split_text(text):
         try:
             await CLIENT.call("send_private_msg", {"user_id": STATE["owner_uin"], "message": part})
         except Exception as e:
             logger.error("send failed: %r", e)
-            return
+            return False
+    return True
+
+
+async def deliver(text: str, task_id=None) -> bool:
+    """先落发件箱再发；失败留在库里，重连后补发——避免 NapCat 断线时结果永久丢失。"""
+    oid = None
+    try:
+        oid = STORE.outbox_add(text, task_id)
+    except Exception as e:
+        logger.warning("outbox add failed: %s", e)
+    ok = await send(text)
+    if oid is not None:
+        try:
+            STORE.outbox_mark(oid, ok, None if ok else "send failed")
+        except Exception as e:
+            logger.warning("outbox mark failed: %s", e)
+    return ok
 
 
 def split_text(text: str, size=CHUNK):
@@ -222,12 +246,22 @@ def _session_invalid(msg: str) -> bool:
         "could not find session", "invalid session"))
 
 
-async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, float, int, int, int]:
+def _describe_tool(block) -> str:
+    """把一次工具调用压成一行，用于进度转发。"""
+    name = block.get("name") or "工具"
+    inp = block.get("input") or {}
+    detail = (inp.get("command") or inp.get("file_path") or inp.get("path")
+              or inp.get("query") or inp.get("description") or "")
+    detail = str(detail).replace("\n", " ").strip()[:80]
+    return f"{name}: {detail}" if detail else str(name)
+
+
+async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
     """跑一次 claude -p。
 
-    返回 (成功?, 给用户看的文本, CLI 估算成本, 退出码, 输入 token, 输出 token)。
-    注意 cost_usd 是 CLI 按 Claude 价目表估的值，DeepSeek 侧实际计费不同，
-    所以成本只作参考；token 数才是能横向比较的指标。
+    返回 (成功?, 文本, CLI 估算成本, 退出码, 输入 token, 输出 token, 错误类型)。
+    错误类型：ok / timeout / parse / cli_error / spawn
+    注意 cost_usd 是 CLI 按 Claude 价目表估的值，DeepSeek 侧实际计费不同。
     """
     global COST_TOTAL, LAST_RESULT
     # 多 worker 并发时不许共用同一个 --resume 会话，否则上下文会互相污染
@@ -236,8 +270,11 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
     async def _once(use_resume: bool):
         # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
         base = list(CFG.get("claude_cmd") or [CLAUDE])
-        args = base + ["-p", prompt, "--output-format", "json",
+        fmt = "stream-json" if STREAM_PROGRESS else "json"
+        args = base + ["-p", prompt, "--output-format", fmt,
                        "--dangerously-skip-permissions"]
+        if STREAM_PROGRESS:
+            args.append("--verbose")
         if use_resume and use_session and STATE.get("session_id"):
             args += ["--resume", STATE["session_id"]]
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
@@ -249,48 +286,84 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
             # WinError 216 = claude.exe 正在被自更新替换，等两秒再试一次
             log(f"启动 claude 失败（{e}），2 秒后重试")
             await asyncio.sleep(2)
-            proc = await asyncio.create_subprocess_exec(
-                *args, cwd=cwd, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE, env=env)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args, cwd=cwd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, env=env)
+            except OSError as e2:
+                return None, f"❌ 无法启动 claude：{e2}", -1, "spawn"
         slot = RUNNING.setdefault(task_id, {})
         slot["proc"] = proc
+        lines: list[str] = []
+        last_emit = [0.0]
+
+        async def consume():
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                lines.append(line)
+                if not STREAM_PROGRESS:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("type") == "assistant" and on_progress:
+                    for block in (ev.get("message") or {}).get("content") or []:
+                        if block.get("type") == "tool_use":
+                            now = time.time()
+                            if now - last_emit[0] >= PROGRESS_MIN_INTERVAL:
+                                last_emit[0] = now
+                                asyncio.create_task(on_progress(_describe_tool(block)))
+
+        reader = asyncio.create_task(consume())
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=TASK_TIMEOUT)
+            await asyncio.wait_for(proc.wait(), timeout=TASK_TIMEOUT)
         except asyncio.TimeoutError:
             _kill_tree(proc.pid)
-            return None, f"⏰ 超过 {TASK_TIMEOUT // 60} 分钟，已强制结束。", -1
+            reader.cancel()
+            return None, f"⏰ 超过 {TASK_TIMEOUT // 60} 分钟，已强制结束。", -1, "timeout"
         except asyncio.CancelledError:
             _kill_tree(proc.pid)
+            reader.cancel()
             raise
         finally:
             slot["proc"] = None
-        return ((out or b"").decode("utf-8", "replace"),
-                (err or b"").decode("utf-8", "replace"), proc.returncode or 0)
+        try:
+            await reader
+        except Exception:
+            pass
+        err = (await proc.stderr.read()).decode("utf-8", "replace")
+        return lines, err, proc.returncode or 0, None
 
-    def _parse(raw):
-        for line in reversed(raw.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line)
-                except Exception:
-                    continue
+    def _parse(lines):
+        if not lines:
+            return None
+        for line in reversed(lines):
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
         return None
 
     resumed = bool(STATE.get("session_id")) and use_session
-    out, err, code = await _once(resumed)
-    if out is None:
-        return False, err, 0.0, code, 0, 0
+    lines, err, code, kind = await _once(resumed)
+    if lines is None:
+        return False, err, 0.0, code, 0, 0, kind or "spawn"
 
-    data = _parse(out)
-    if data is None and resumed and _session_invalid(err or out):
+    data = _parse(lines)
+    tail = "\n".join(lines[-8:])
+    if data is None and resumed and _session_invalid(err or tail):
         log("resume 失败（旧会话不存在），改用新会话重试")
-        out, err, code = await _once(False)
-        if out is None:
-            return False, err, 0.0, code, 0, 0
-        data = _parse(out)
+        lines, err, code, kind = await _once(False)
+        if lines is None:
+            return False, err, 0.0, code, 0, 0, kind or "spawn"
+        data = _parse(lines)
+        tail = "\n".join(lines[-8:])
     if data is None:
-        return False, f"❌ claude 输出无法解析：\n{(err or out or '')[-800:]}", 0.0, code, 0, 0
+        return (False, f"❌ claude 输出无法解析：\n{(err or tail)[-800:]}", 0.0, code,
+                0, 0, "parse")
 
     sid = data.get("session_id")
     if sid and use_session:
@@ -314,7 +387,8 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
         pass
     if text and len(text) > 3000:
         text = f"{text[:3000]}\n\n……（结果较长，共 {len(text)} 字，发 /全文 看剩下部分）"
-    return (not is_error), (text or "（任务完成，没有文字输出）"), cost, code, tokens_in, tokens_out
+    return ((not is_error), (text or "（任务完成，没有文字输出）"), cost, code,
+            tokens_in, tokens_out, "ok" if not is_error else "cli_error")
 
 
 async def _cwd_lock(cwd: str) -> asyncio.Lock:
@@ -360,12 +434,16 @@ async def _execute(row, cwd):
     audit(AUDIT_PATH, event="task_start", id=tid, source=row["source"], text=text[:500])
     log(f"任务开始 [{tid}]：{text[:200]}")
 
-    run_task = asyncio.create_task(run_claude(prompt, tid, cwd))
+    async def _progress(msg):
+        # 进度也进发件箱：断线时不丢
+        await deliver(f"🔧 {msg}", tid)
+
+    run_task = asyncio.create_task(run_claude(prompt, tid, cwd, on_progress=_progress))
     RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd}
     hb = asyncio.create_task(heartbeat(tid, started))
-    cost, tin, tout = 0.0, 0, 0
+    cost, tin, tout, kind = 0.0, 0, 0, "ok"
     try:
-        ok, reply, cost, code, tin, tout = await run_task
+        ok, reply, cost, code, tin, tout, kind = await run_task
     except asyncio.CancelledError:
         if not run_task.cancelled():
             raise
@@ -377,7 +455,7 @@ async def _execute(row, cwd):
         return
     except Exception as e:
         logger.exception("task exception")
-        ok, reply, cost, code, tin, tout = False, f"❌ 执行异常：{e}", 0.0, -1, 0, 0
+        ok, reply, cost, code, tin, tout, kind = False, f"❌ 执行异常：{e}", 0.0, -1, 0, 0, "exception"
     finally:
         hb.cancel()
 
@@ -385,8 +463,10 @@ async def _execute(row, cwd):
     state = "succeeded" if ok else "failed"
     STORE.finish(tid, state, result=reply, error=None if ok else reply,
                  exit_code=code, cost_usd=cost, duration_ms=int(seconds * 1000),
-                 tokens_in=tin, tokens_out=tout)
+                 tokens_in=tin, tokens_out=tout, error_kind=None if ok else kind)
     METRICS.inc("qq_remote_tasks_total", {"state": state})
+    if not ok:
+        METRICS.inc("qq_remote_task_errors_total", {"kind": kind})
     METRICS.observe("qq_remote_task_duration_seconds", seconds)
     METRICS.inc("qq_remote_cost_usd_total", {}, cost)
     METRICS.inc("qq_remote_tokens_total", {"direction": "in"}, tin)
@@ -396,12 +476,12 @@ async def _execute(row, cwd):
           tokens_in=tin, tokens_out=tout, result=(reply or "")[:2000])
     STATE["last_tokens_in"] = tin
     log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s tokens={tin}+{tout}")
-    await send(("✅ " if ok else "⚠️ ") + reply)
+    await deliver(("✅ " if ok else "⚠️ ") + reply, tid)
     if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
         STATE["session_id"] = ""
         save_state()
         log(f"上下文自动重置：本次输入 {tin} token 超过上限 {SESSION_TOKEN_LIMIT}")
-        await send(f"🧹 本次任务读了 {tin / 1000:.0f}k token，已自动开新会话省成本。"
+        await deliver(f"🧹 本次任务读了 {tin / 1000:.0f}k token，已自动开新会话省成本。"
                    f"需要接着上文的话，先发 /新会话 前的任务里说明背景。")
     _cleanup(tid)
 
@@ -621,6 +701,11 @@ async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender
         return {"status": "rejected", "error": "empty"}
     if STORE.queue_depth() >= MAX_QUEUE:
         return {"status": "full", "limit": MAX_QUEUE}
+    # 额度：防止账号被盗后被无限刷（0 = 不限）
+    if MAX_TASKS_PER_HOUR and STORE.count_since(3600) >= MAX_TASKS_PER_HOUR:
+        return {"status": "quota", "reason": f"每小时最多 {MAX_TASKS_PER_HOUR} 个任务，稍后再试"}
+    if MAX_TOKENS_PER_DAY and STORE.tokens_since(86400) >= MAX_TOKENS_PER_DAY:
+        return {"status": "quota", "reason": f"今天的 token 额度（{MAX_TOKENS_PER_DAY}）已用完"}
     reason = danger_reason_task(text)
     if reason and not confirmed:
         return await _ask_confirm("task", text, source, reason)
@@ -737,6 +822,8 @@ async def on_message(data):
         log(f"忽略重复投递：{dedup}")
     elif status == "full":
         await send(f"📮 队列满了（{MAX_QUEUE} 个待执行），先等前面的跑完。")
+    elif status == "quota":
+        await send(f"🚦 {res.get('reason')}")
 
 
 SEEN_FLAGS = {}
@@ -775,6 +862,18 @@ async def serve(ws):
             await send(f"⚠️ 上次重启时有 {len(PENDING_NOTICES)} 个任务被打断：\n{names}\n"
                        f"发 /任务 查看，需要的话重发。")
             PENDING_NOTICES = []
+        # 补发断线期间没送达的结果（最多 20 条，避免长时间离线后刷屏）
+        try:
+            pending = STORE.outbox_pending(20)
+            if pending:
+                log(f"补发 {len(pending)} 条未送达消息")
+            for row in pending:
+                ok = await send(row.get("body") or "")
+                STORE.outbox_mark(row["id"], ok)
+                if not ok:
+                    break
+        except Exception as e:
+            logger.warning("outbox flush failed: %s", e)
         while True:
             get_task = asyncio.create_task(client.events.get())
             done, _ = await asyncio.wait({get_task, reader}, return_when=asyncio.FIRST_COMPLETED)
@@ -839,8 +938,44 @@ def panel_metrics():
     return METRICS.render()
 
 
+async def janitor():
+    """定期清理过期数据（任务/事件/已送达发件箱），并回收 SQLite 空间。"""
+    await asyncio.sleep(60)   # 启动后先让系统稳定一会儿
+    while True:
+        try:
+            n = STORE.prune(RETENTION_DAYS)
+            if n:
+                log(f"清理过期数据 {n} 条（保留 {RETENTION_DAYS} 天）")
+                STORE.vacuum()
+        except Exception as e:
+            logger.warning("prune failed: %s", e)
+        await asyncio.sleep(6 * 3600)
+
+
+def acquire_single_instance_lock():
+    """只有一个 bridge 能跑：绑一个本地端口当锁（进程退出时自动释放）。
+
+    为什么会需要：守护脚本或手工重启时可能同时起两个进程，它们会抢同一个
+    state.json / SQLite，表现为上下文和主人号随机乱跳。
+    """
+    import socket
+    port = int(CFG.get("instance_lock_port", 30991))
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
 async def main():
     global PENDING_NOTICES
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        log("已有 bridge 实例在跑（实例锁被占），本进程退出")
+        return
     load_state()
     # 上次崩溃/重启时还在跑的任务：标 interrupted 并准备通知
     rows = STORE.recover_interrupted()
@@ -854,6 +989,7 @@ async def main():
     save_state()
     for i in range(WORKERS):
         asyncio.create_task(worker(i))
+    asyncio.create_task(janitor())
     panel = Panel(PANEL_PORT, PANEL_TOKEN, asyncio.get_running_loop(),
                   state_fn=panel_state, tasks_fn=panel_tasks, submit_coro=submit_task,
                   events_fn=panel_events, metrics_fn=panel_metrics)
