@@ -6,7 +6,8 @@ import sys
 
 from websockets.asyncio.client import connect
 
-TOKEN = "a7f3c9d21b8e4650"
+from _cfg import napcat_token
+TOKEN = napcat_token()
 IMG = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\win11\qq-remote\tmp\roxy_anilist.png"
 
 

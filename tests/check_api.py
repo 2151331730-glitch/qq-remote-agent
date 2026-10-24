@@ -6,7 +6,8 @@ import json
 from websockets.asyncio.client import connect
 
 URL = "ws://127.0.0.1:3001"
-TOKEN = "a7f3c9d21b8e4650"
+from _cfg import napcat_token
+TOKEN = napcat_token()
 
 
 async def main():

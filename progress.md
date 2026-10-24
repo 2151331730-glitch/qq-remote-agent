@@ -51,7 +51,7 @@
 ### 2026-10-24 16:10 真机登录成功（方式与原计划不同）
 - 二维码扫不了 → 改用 WebUI 的**「密码登录」**标签，账号 3089461079 + 密码直接登进去了，
   没有触发短信/设备验证。
-- WebUI token：`8af37b01ccb6`（在 `napcat\config\webui.json`）。
+- WebUI token：见 `napcat\config\webui.json`（**不写入文档，也不要打印**）。
 - 结果：`get_login_info` 返回 `{"user_id":3089461079,"nickname":"Sesame"}`；
   OneBot WS 3001 已监听；bridge 16:10:45 自动连上；`send_private_msg` 给自己返回 ok/0。
 - 好友列表目前只有它自己 —— 等用户大号加好友后才能端到端测。

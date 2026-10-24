@@ -13,7 +13,8 @@ from pathlib import Path
 from websockets.asyncio.server import serve
 
 ROOT = Path(r"C:\Users\win11\qq-remote")
-TOKEN = "a7f3c9d21b8e4650"
+from _cfg import napcat_token
+TOKEN = napcat_token()
 SENT = []
 
 

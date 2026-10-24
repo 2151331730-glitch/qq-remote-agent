@@ -19,3 +19,6 @@ downloads/
 
 # 本机专用
 .venv/
+
+# 本机配置文件里有 token，入库只放 example
+bridge/config.json
