@@ -71,9 +71,18 @@ MAX_TOKENS_PER_DAY = int(CFG.get("max_tokens_per_day", 2_000_000))
 RETENTION_DAYS = int(CFG.get("retention_days", 30))
 # 流式进度：把工具调用转发到 QQ，长任务不再只有"还在执行"
 STREAM_PROGRESS = bool(CFG.get("stream_progress", True))
+# 逐字流式：把 assistant 的文本增量也发到 QQ，体验接近 TUI 的边生成边显示
+STREAM_TEXT = bool(CFG.get("stream_text", True))
+STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
+STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
+MODEL = CFG.get("model") or ""
 # agent 任务跑在哪：none = Windows 本体（默认）；wsl = 在 WSL 里跑 Linux 侧 CLI
 AGENT_SANDBOX = str(CFG.get("agent_sandbox") or "none").lower()
 AGENT_SANDBOX_CMD = list(CFG.get("agent_sandbox_cmd") or ["claude"])
+AGENT_SANDBOX_PATH = str(CFG.get("agent_sandbox_path") or "~/.local/node/bin")
+AGENT_SANDBOX_ENV = str(CFG.get("agent_sandbox_env_file") or "~/.config/qq-agent/env")
+AGENT_SANDBOX_WORKDIR = str(CFG.get("agent_sandbox_workdir") or "~/agent-work")
+AGENT_SANDBOX_NO_PROXY = str(CFG.get("agent_sandbox_no_proxy") or "api.deepseek.com")
 PROGRESS_MIN_INTERVAL = float(CFG.get("progress_min_interval", 15))
 WORKERS = max(1, int(CFG.get("workers", 1)))
 PANEL_PORT = int(CFG.get("panel_port", 3099))
@@ -258,6 +267,18 @@ def _session_invalid(msg: str) -> bool:
         "could not find session", "invalid session"))
 
 
+def _plain(text: str) -> str:
+    """把 markdown 压成适合 QQ 的纯文本（QQ 不渲染 markdown）。"""
+    import re
+    t = text or ""
+    t = re.sub(r"```[a-zA-Z0-9_-]*", "", t)       # 代码围栏标记
+    t = re.sub(r"[*][*](.+?)[*][*]", r"\1", t)   # 粗体
+    t = re.sub(r"`([^`]+)`", r"\1", t)         # 行内代码
+    t = re.sub(r"(?m)^#{1,6}\s*", "", t)       # 标题
+    t = re.sub(r"\n{3,}", "\n\n", t)     # 多余空行
+    return t.strip()
+
+
 def _describe_tool(block) -> str:
     """把一次工具调用压成一行，用于进度转发。"""
     name = block.get("name") or "工具"
@@ -271,22 +292,47 @@ def _describe_tool(block) -> str:
 def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: bool):
     """把 agent 命令包进 WSL 执行。
 
-    提示词写文件再用 $(cat ...) 传，避免长中文提示在命令行里被转义搞坏。
+    三个坑（都实测踩过）：
+    1. 提示词写文件再用 $(cat ...) 传，避免长中文提示在命令行里被转义搞坏；
+    2. Windows 侧 `.claude/settings.json` 里的 `HTTPS_PROXY=127.0.0.1:7892` 在 WSL 里
+       指向 WSL 自己，API 调用会瞬间 ECONNREFUSED —— 所以要用中性工作目录（不让它读到
+       那份项目配置），并把目标域名加进 NO_PROXY；
+    3. `--add-dir` 把 Windows 目录授权给 agent，因为 cwd 已经换成 WSL 侧目录。
     """
     import shlex
     import tempfile
     pf = Path(tempfile.gettempdir()) / f"qq-prompt-{task_id}.txt"
     pf.write_text(prompt, encoding="utf-8")
-    inner = " ".join(shlex.quote(x) for x in AGENT_SANDBOX_CMD)
-    inner += ' -p "$(cat ' + shlex.quote(sandbox._win_to_wsl(str(pf))) + ')"'
-    inner += f" --output-format {shlex.quote(fmt)}"
+    cmd = " ".join(shlex.quote(x) for x in AGENT_SANDBOX_CMD)
+    cmd += ' -p "$(cat ' + shlex.quote(sandbox._win_to_wsl(str(pf))) + ')"'
+    cmd += f" --output-format {shlex.quote(fmt)}"
     if fmt == "stream-json":
-        inner += " --verbose"
-    inner += " --dangerously-skip-permissions"
+        cmd += " --verbose"
+        if STREAM_TEXT:
+            cmd += " --include-partial-messages"
+    if MODEL:
+        cmd += " --model " + shlex.quote(MODEL)
+    cmd += " --dangerously-skip-permissions"
+    if cwd:
+        cmd += " --add-dir " + shlex.quote(sandbox._win_to_wsl(cwd))
     if use_resume and STATE.get("session_id"):
-        inner += " --resume " + shlex.quote(STATE["session_id"])
-    return ["wsl", "-e", "bash", "-lc",
-            f"cd {shlex.quote(sandbox._win_to_wsl(cwd))} && {inner}"]
+        cmd += " --resume " + shlex.quote(STATE["session_id"])
+
+    # `~` 放在双引号里不会展开，统一换成 $HOME
+    _exp = lambda s: s.replace("~", "$HOME", 1) if s.startswith("~") else s  # noqa: E731
+    path_dir = _exp(AGENT_SANDBOX_PATH)
+    env_file = _exp(AGENT_SANDBOX_ENV)
+    workdir = _exp(AGENT_SANDBOX_WORKDIR)
+    no_proxy = AGENT_SANDBOX_NO_PROXY
+    script = (
+        f'export PATH="{path_dir}:$PATH"; '
+        f'[ -f "{env_file}" ] && . "{env_file}"; '
+        "unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy; "
+        f'export NO_PROXY="localhost,127.0.0.1,::1,{no_proxy}"; '
+        f'mkdir -p "{workdir}"; cd "{workdir}"; '
+        f"{cmd}"
+    )
+    return ["wsl", "-e", "bash", "-lc", script]
 
 
 def check_agent_sandbox() -> bool:
@@ -306,7 +352,7 @@ def check_agent_sandbox() -> bool:
     return ok
 
 
-async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
+async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_text=None):
     """跑一次 claude -p。
 
     返回 (成功?, 文本, CLI 估算成本, 退出码, 输入 token, 输出 token, 错误类型)。
@@ -328,6 +374,10 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
                            "--dangerously-skip-permissions"]
             if STREAM_PROGRESS:
                 args.append("--verbose")
+                if STREAM_TEXT:
+                    args.append("--include-partial-messages")
+            if MODEL:
+                args += ["--model", MODEL]
             if use_resume and use_session and STATE.get("session_id"):
                 args += ["--resume", STATE["session_id"]]
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", WSL_UTF8="1")
@@ -349,6 +399,8 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
         slot["proc"] = proc
         lines: list[str] = []
         last_emit = [0.0]
+        text_buf: list[str] = []
+        last_text = [time.time()]
 
         async def consume():
             async for raw in proc.stdout:
@@ -369,6 +421,23 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
                             if now - last_emit[0] >= PROGRESS_MIN_INTERVAL:
                                 last_emit[0] = now
                                 asyncio.create_task(on_progress(_describe_tool(block)))
+                elif ev.get("type") == "stream_event" and on_text:
+                    inner = ev.get("event") or {}
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            text_buf.append(delta["text"])
+                            buf = "".join(text_buf)
+                            punct = chr(10) + "。！？.!?:：；;"
+                            long_enough = len(buf) >= STREAM_TEXT_MIN
+                            due = ((long_enough and buf[-1] in punct)
+                                   or (time.time() - last_text[0] >= STREAM_TEXT_INTERVAL
+                                       and len(buf) >= 20))
+                            if due:
+                                chunk = "".join(text_buf)
+                                text_buf.clear()
+                                last_text[0] = time.time()
+                                asyncio.create_task(on_text(chunk))
 
         reader = asyncio.create_task(consume())
         try:
@@ -491,7 +560,14 @@ async def _execute(row, cwd):
         # 进度也进发件箱：断线时不丢
         await deliver(f"🔧 {msg}", tid)
 
-    run_task = asyncio.create_task(run_claude(prompt, tid, cwd, on_progress=_progress))
+    async def _text(chunk):
+        # 逐字流式：像 TUI 那样边生成边显示（已按字数和时间合并，避免刷屏）
+        txt = _plain(chunk)
+        if txt:
+            await deliver(txt, tid)
+
+    run_task = asyncio.create_task(
+        run_claude(prompt, tid, cwd, on_progress=_progress, on_text=_text))
     RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd}
     hb = asyncio.create_task(heartbeat(tid, started))
     cost, tin, tout, kind = 0.0, 0, 0, "ok"
@@ -529,7 +605,8 @@ async def _execute(row, cwd):
           tokens_in=tin, tokens_out=tout, result=(reply or "")[:2000])
     STATE["last_tokens_in"] = tin
     log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s tokens={tin}+{tout}")
-    await deliver(("✅ " if ok else "⚠️ ") + reply, tid)
+    footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok"
+    await deliver(("✅ " if ok else "⚠️ ") + _plain(reply) + footer, tid)
     if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
         STATE["session_id"] = ""
         save_state()
@@ -568,6 +645,8 @@ HELP = """命令：
 /全文 看上次完整结果
 /cd <路径> 换工作目录
 /心跳 测试是否在线
+/model <名称> 切换模型（default 恢复）
+/cost 看 token 与花费
 !<命令> 直接执行 PowerShell（例：!dir C:\\）
 !!<命令> 在沙箱里执行（WSL/Docker，隔离但只挂载当前目录）
 其他任何文字 = 交给 claude 干活
@@ -689,6 +768,25 @@ async def handle_command(text: str) -> bool:
 
     if low in ("/心跳", "/ping"):
         await send("🏓 我在。")
+        return True
+
+    if low.startswith("/model"):
+        arg = t[6:].strip()
+        global MODEL
+        if not arg:
+            await send(f"当前模型：{MODEL or '（跟随默认配置）'}\n用法：/model <模型名>（用 default 恢复默认）")
+        elif arg.lower() in ("default", "默认"):
+            MODEL = CFG.get("model") or ""
+            await send("🧹 已恢复默认模型")
+        else:
+            MODEL = arg
+            await send(f"🧠 后续任务使用模型：{MODEL}")
+        return True
+
+    if low in ("/cost", "/花费"):
+        st = STORE.stats()
+        await send(f"今日（24h）：{st['window_runs']} 次 · 入 {st['tokens_in'] / 1000:.0f}k / 出 {st['tokens_out'] / 1000:.0f}k tok\n"
+                   f"估算花费 24h ${st['window_cost']:.3f} · 累计 ${st['total_cost']:.3f}")
         return True
 
     if low.startswith("/日志") or low.startswith("/log"):

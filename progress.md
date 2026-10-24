@@ -230,3 +230,14 @@
   实测沙箱：容器内执行 + `--network none` 断网 + 只挂 `/work`，单条约 6 秒。
   常驻内存约 5.2 GB（vmmemWSL 4.4 GB）→ 已移除开机自启，`auto` 后端在引擎未启动时回退 WSL。
 - **测试**：73 个（新增 docker 回退/优先级 3 个）。
+
+### 2026-10-24 20:00-20:25 WSL agent 沙箱实机 + TUI 手感
+- WSL 里装好 Node 22（npmmirror 用户级）+ Claude Code 2.1.310（`npm config set os linux`，
+  否则装成 Windows 的 claude.exe，靠 interop 执行会卡死）。
+- 三个坑：Windows `settings.json` 的 `HTTPS_PROXY=127.0.0.1:7892` 在 WSL 指向自己 →
+  ECONNREFUSED；`~` 在引号里不展开导致 env 文件没 source；写 env 文件时 CRLF 让 URL 畸形。
+  解法：中性工作目录（`~/agent-work`）+ `--add-dir` 授权 Windows 目录 + 去掉代理 + `$HOME` 展开 + `sed -i 's/\r$//'`。
+- 实机验证：`run_claude` 经桥调用 WSL 里的 claude，`ok=True`，进度里有 `Bash: find ...`。
+- TUI 手感：`--include-partial-messages` 文本增量 → 按标点/80 字/1.5 秒合并逐条发送；
+  结果末尾加 `⏱ 耗时 · token`；markdown 自动压成纯文本；新增 `/model`、`/cost`。
+- 实测：一条任务在 QQ 侧先出 2-3 段增量，最后一条是完整结果+状态行。
