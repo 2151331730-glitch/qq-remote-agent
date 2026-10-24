@@ -101,7 +101,34 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 | 重启电脑后不跑 | 计划任务是否注册、是否 `RunLevel Highest` |
 | 改了代码没效果 | 见上节：进程启动时间 vs 文件修改时间 |
 
+## 公开聊天通道（改这里前必读）
+
+三类消息的边界：
+
+| 来源 | 走哪条路 | 能做什么 |
+|---|---|---|
+| 主人私聊 | `on_message` → 命令 / task / chat | 全部权限（含 `!` 命令、任务执行） |
+| 陌生人私聊 | `on_public_private` → `handle_public` | 只陪聊 |
+| 群聊 | `on_group_message`（仅 @ 或前缀触发）→ `handle_public` | 只陪聊，回复发回原群 |
+
+- **安全边界做在启动参数上，不是提示词上**：公开通道用
+  `--tools "" --strict-mcp-config --system-prompt <PUBLIC_SYSTEM>`，
+  模型手里没有任何工具（连 `qq_send_text` 这类 MCP 也加载不到），
+  所以陌生人的提示词注入拿不到执行能力。不要为了"方便"给公开通道加工具。
+- 公开通道 **不注入人格 `persona.md` 和长期记忆 `memory.md`**，避免泄露主人信息；
+  群/人之间的会话按 `group:<gid>` / `user:<uid>` 分开，且只存在内存里，重启即忘。
+- 限流：`public_max_per_hour`（全局每小时）、`public_cooldown_seconds`（单会话冷却）、
+  `public_max_pending`（同时排队数）、`public_max_input_chars`（输入截断）、
+  `public_max_reply_chars`（回复截断）。总开关 `public_chat`。
+- 公开回复不走发件箱（陌生人消息丢了就丢了，不值得入库），失败只记日志。
+- 好友申请：陌生人 **不自动同意也不自动拒绝**（留在 QQ 里等主人处理），只私聊提醒主人一次/小时；
+  只有 `owner_uin` 自己的申请会自动同意。不要改回"自动同意"，等于给陌生人开放私聊入口。
+- 未配置 `owner_uin` 时所有私聊都被忽略（旧版会绑定第一个发消息的人，已被移除，防账号劫持）。
+- 诊断：群里不回 → ① 是否 @ 了 ② 机器人在不在群 ③ `logs/bridge.log` 有没有 `公开聊天 [group:…]`
+  ④ 是否触发限流（日志里 `公开聊天跳过（hourly）`）。
+
 ## 任务队列语义（改队列前必读）
+
 
 - 状态机：`queued → running → succeeded | failed | cancelled | interrupted`，只有 `queued` 能被 `/取消 <ID>`。
 - 通道：`tasks.kind` = `task`（执行语义 + `session_id`）或 `chat`（闲聊 + `chat_session_id`）；
