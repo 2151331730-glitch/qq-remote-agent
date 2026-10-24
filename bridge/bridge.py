@@ -76,6 +76,9 @@ STREAM_TEXT = bool(CFG.get("stream_text", True))
 STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
 STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
 MODEL = CFG.get("model") or ""
+# 盯梢：长时间没有任何输出就提示/中止，避免"卡住没人知道"
+STALL_WARN_SEC = int(CFG.get("stall_warn_seconds", 90))
+STALL_KILL_SEC = int(CFG.get("stall_kill_seconds", 300))
 # agent 任务跑在哪：none = Windows 本体（默认）；wsl = 在 WSL 里跑 Linux 侧 CLI
 AGENT_SANDBOX = str(CFG.get("agent_sandbox") or "none").lower()
 AGENT_SANDBOX_CMD = list(CFG.get("agent_sandbox_cmd") or ["claude"])
@@ -400,6 +403,7 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
         lines: list[str] = []
         last_emit = [0.0]
         text_buf: list[str] = []
+        last_out = [time.time()]
         last_text = [time.time()]
 
         async def consume():
@@ -408,6 +412,7 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                 if not line:
                     continue
                 lines.append(line)
+                last_out[0] = time.time()
                 if not STREAM_PROGRESS:
                     continue
                 try:
@@ -440,6 +445,21 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                                 asyncio.create_task(on_text(chunk))
 
         reader = asyncio.create_task(consume())
+        stall = {"killed": False}
+
+        async def watch():
+            while not reader.done():
+                await asyncio.sleep(10)
+                idle = time.time() - last_out[0]
+                if idle >= STALL_KILL_SEC:
+                    log(f"任务长时间无输出（{idle:.0f}s），判定卡死并中止")
+                    stall["killed"] = True
+                    _kill_tree(proc.pid)
+                    return
+                if idle >= STALL_WARN_SEC and on_progress:
+                    await on_progress(f"模型已 {idle:.0f} 秒没有输出，可能卡住了")
+
+        watcher = asyncio.create_task(watch())
         try:
             await asyncio.wait_for(proc.wait(), timeout=TASK_TIMEOUT)
         except asyncio.TimeoutError:
@@ -452,11 +472,14 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
             raise
         finally:
             slot["proc"] = None
+        watcher.cancel()
         try:
             await reader
         except Exception:
             pass
         err = (await proc.stderr.read()).decode("utf-8", "replace")
+        if stall["killed"]:
+            return None, f"⏰ 超过 {STALL_KILL_SEC} 秒没有任何输出，已中止（疑似卡死）", -1, "stalled"
         return lines, err, proc.returncode or 0, None
 
     def _parse(lines):
