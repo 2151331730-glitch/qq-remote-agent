@@ -155,11 +155,17 @@ class _Handler(BaseHTTPRequestHandler):
         p = self.server.panel
         if not self.path.startswith("/api/task"):
             return self._send(404, '{"error":"not found"}')
+        # 先把请求体读完再鉴权：否则客户端还在写 body 时服务端就关连接，
+        # 会触发 ConnectionAborted / RST（测试里表现为随机失败）。
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else b"{}"
+        except Exception:
+            return self._send(400, '{"error":"bad body"}')
         if self.headers.get("X-Panel-Token", "") != p.token:
             return self._send(403, '{"error":"bad token"}')
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            body = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return self._send(400, '{"error":"bad json"}')
         text = (body.get("text") or "").strip()
