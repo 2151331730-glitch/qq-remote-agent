@@ -35,6 +35,7 @@ import memory
 import context as context_mod
 import history
 import policy
+import chatstyle
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
 from metrics import METRICS
@@ -147,6 +148,12 @@ def load_public_system() -> str:
         logger.warning("public persona load failed: %s", e)
     return PUBLIC_SYSTEM
 PUBLIC_TEMPLATE = str(CFG.get("public_prompt_template") or "{task}")
+# 分条发：长回复拆成 2~3 条短消息，中间停顿一下，像真人在打字
+PUBLIC_BUBBLES = bool(CFG.get("public_bubbles", True))
+PUBLIC_BUBBLE_MIN = int(CFG.get("public_bubble_min_chars", 80))
+PUBLIC_BUBBLE_LIMIT = int(CFG.get("public_bubble_max_chars", 140))
+PUBLIC_BUBBLE_PARTS = int(CFG.get("public_bubble_max_parts", 3))
+PUBLIC_BUBBLE_DELAY = float(CFG.get("public_bubble_delay", 0.7))
 
 # 自动读上下文：回复前拉最近若干条消息压成摘录（群聊拉群历史，私聊拉对方历史）
 CONTEXT_ENABLED = bool(CFG.get("context_enabled", True))
@@ -292,6 +299,11 @@ def reload_config() -> dict:
     g["PUBLIC_MAX_REPLY"] = int(CFG.get("public_max_reply_chars", 400))
     g["PUBLIC_MAX_INPUT"] = int(CFG.get("public_max_input_chars", 1000))
     g["PUBLIC_MAX_PENDING"] = int(CFG.get("public_max_pending", 3))
+    g["PUBLIC_BUBBLES"] = bool(CFG.get("public_bubbles", True))
+    g["PUBLIC_BUBBLE_MIN"] = int(CFG.get("public_bubble_min_chars", 80))
+    g["PUBLIC_BUBBLE_LIMIT"] = int(CFG.get("public_bubble_max_chars", 140))
+    g["PUBLIC_BUBBLE_PARTS"] = int(CFG.get("public_bubble_max_parts", 3))
+    g["PUBLIC_BUBBLE_DELAY"] = float(CFG.get("public_bubble_delay", 0.7))
     g["CONTEXT_ENABLED"] = bool(CFG.get("context_enabled", True))
     g["CONTEXT_MESSAGES"] = int(CFG.get("context_messages", 12))
     g["CONTEXT_MAX_CHARS"] = int(CFG.get("context_max_chars", 1200))
@@ -589,8 +601,11 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
         base = list(CFG.get("claude_cmd") or [CLAUDE])
         fmt = "json" if is_public else ("stream-json" if STREAM_PROGRESS else "json")
         if is_public:
+            # 公开通道只有"看网页"这一种能力：能查网上资料，碰不到本机
             args = base + ["-p", prompt, "--output-format", "json",
-                           "--tools", "", "--strict-mcp-config",
+                           "--tools", "WebSearch,WebFetch",
+                           "--allowedTools", "WebSearch,WebFetch",
+                           "--strict-mcp-config",
                            "--system-prompt", load_public_system()]
             if use_resume and session:
                 args += ["--resume", session]
@@ -970,6 +985,21 @@ async def send_to(target_type: str, target_id: int, text: str) -> bool:
     return ok
 
 
+async def _send_bubbles(target_type: str, target_id: int, body: str) -> bool:
+    """分条发送：长回复拆成 2~3 条，中间随机停顿，像人在打字。"""
+    parts = (chatstyle.split_bubbles(body, PUBLIC_BUBBLE_MIN, PUBLIC_BUBBLE_LIMIT,
+                                     PUBLIC_BUBBLE_PARTS)
+             if PUBLIC_BUBBLES else [body])
+    ok = True
+    for i, part in enumerate(parts):
+        if i:
+            await asyncio.sleep(random.uniform(0.35, max(0.4, PUBLIC_BUBBLE_DELAY)))
+        if not await send_to(target_type, target_id, part):
+            ok = False
+            break
+    return ok
+
+
 def _group_text(data, self_id):
     """从群消息里取出文字，并判断有没有 @ 机器人。"""
     at_me = False
@@ -1089,7 +1119,7 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
 
     body = _plain(reply or "").strip() or "（我这边没说出话来，再说一遍试试？）"
     body = body[:PUBLIC_MAX_REPLY]
-    sent = await send_to(target_type, target_id, body)
+    sent = await _send_bubbles(target_type, target_id, body)
     _record(scope, int(CFG.get("bot_uin") or 0), "我", body)
     if tin > SESSION_TOKEN_LIMIT:
         set_session("public", "", scope)   # 会话太长就换新的，避免每句都背着整段历史

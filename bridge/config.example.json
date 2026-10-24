@@ -51,5 +51,10 @@
   "stream_text_interval": 1.5,
   "chat_session_token_limit": 30000,
   "chat_max_budget_usd": 0.12,
-  "chat_slow_note_seconds": 45
+  "chat_slow_note_seconds": 45,
+  "public_bubbles": true,
+  "public_bubble_min_chars": 80,
+  "public_bubble_max_chars": 140,
+  "public_bubble_max_parts": 3,
+  "public_bubble_delay": 0.7
 }
