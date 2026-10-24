@@ -215,3 +215,18 @@
 并加单实例锁兜底。这条也说明守护脚本必须在管理员权限下跑（计划任务里是，手工验证要注意）。
 
 **测试**：70 个（新增 outbox/额度/清理/流式/错误分类）。
+
+### 2026-10-24 19:10-19:35 公开仓库 + Docker 沙箱实机验证
+
+- **公开仓库**：`https://github.com/2151331730-glitch/qq-remote-agent`（MIT）。
+  推之前做了脱敏：QQ 号/昵称替占位符、测试改用相对路径、`apply-webui.ps1` 从配置读号、
+  `bridge/config.json` 不入库（只有 example）。
+- **CI 三次失败教会三件事**：
+  1. pytest 默认收集 `*_test.py`，把需要真机配置的 `mock_test*.py` 当用例 → 加 `pytest.ini` 限定 `test_*.py`
+  2. 桥无条件 import Redis → SQLite 环境没装 `redis` 包就崩 → 改按需导入
+  3. 403 响应在客户端写完请求体前就断开 → ConnectionAborted 偶发失败 → 服务端先读完 body 再鉴权
+  最终 3.11 / 3.13 双版本全绿。
+- **Docker Desktop 4.96.3**：engine 29.9.2，`docker` 未进 PATH（改用固定安装路径）。
+  实测沙箱：容器内执行 + `--network none` 断网 + 只挂 `/work`，单条约 6 秒。
+  常驻内存约 5.2 GB（vmmemWSL 4.4 GB）→ 已移除开机自启，`auto` 后端在引擎未启动时回退 WSL。
+- **测试**：73 个（新增 docker 回退/优先级 3 个）。

@@ -90,6 +90,9 @@ claim 用 Lua 脚本把"检查状态 + 改状态 + 出队"做成原子操作。
 ### ADR-009 沙箱边界：只隔离 `!` 命令，且只缩小破坏半径
 **背景**：agent 任务跑 `claude.exe`（Windows 二进制，要读本机配置），没法整体塞进容器。
 **做法**：`!!` 前缀的 shell 命令走沙箱后端：Docker（`--network none --rm`，只挂载 cwd）或 WSL（Ubuntu，看不到注册表/服务）。
+**实测（2026-10-24）**：Docker 后端在容器内执行成功，`wget` 出网被拒（`NET_BLOCKED`），`/work` 挂载可见；
+单条命令约 6 秒（WSL 约 0.5 秒），所以 `auto` 优先 Docker 但引擎没开时自动落到 WSL。
+Docker Desktop 常驻约 5 GB 内存，默认**不随开机启动**，需要用时再开。
 **诚实结论**：这不叫安全沙箱。agent 任务仍然是全权限；沙箱只把"命令级破坏"从整机缩小到一个目录。
 **没做的**：Windows AppContainer / 受限令牌；真要强隔离得把 agent 也容器化。
 
