@@ -17,3 +17,46 @@
 [ 171s] rss=  39.8MB cpu=25.1% queue= 55 done= 286 failed= 0 p95=567ms
 [ 181s] rss=  41.7MB cpu=27.1% queue= 58 done= 303 failed= 0 p95=566ms
 [ 191s] rss=  43.7MB cpu=28.2% queue= 61 done= 320 failed= 0 p95=564ms
+[ 201s] rss=  45.9MB cpu=28.8% queue= 64 done= 337 failed= 0 p95=563ms
+[ 211s] rss=  48.4MB cpu=29.7% queue= 67 done= 354 failed= 0 p95=563ms
+[ 221s] rss=  50.5MB cpu=28.3% queue= 71 done= 370 failed= 0 p95=566ms
+[ 231s] rss=  52.6MB cpu=26.8% queue= 74 done= 387 failed= 0 p95=564ms
+[ 241s] rss=  55.0MB cpu=25.5% queue= 77 done= 405 failed= 0 p95=564ms
+[ 251s] rss=  57.1MB cpu=25.4% queue= 80 done= 422 failed= 0 p95=565ms
+[ 261s] rss=  39.0MB cpu=26.1% queue= 84 done= 438 failed= 0 p95=566ms
+[ 271s] rss=  41.1MB cpu=31.0% queue= 87 done= 455 failed= 0 p95=565ms
+[ 281s] rss=  43.1MB cpu=26.9% queue= 91 done= 471 failed= 0 p95=565ms
+[ 291s] rss=  45.4MB cpu=29.8% queue= 95 done= 487 failed= 0 p95=566ms
+[ 301s] rss=  47.6MB cpu=28.3% queue= 98 done= 504 failed= 0 p95=566ms
+[ 311s] rss=  49.7MB cpu=29.7% queue=102 done= 520 failed= 0 p95=566ms
+[ 321s] rss=  52.0MB cpu=25.8% queue=105 done= 537 failed= 0 p95=568ms
+[ 332s] rss=  54.0MB cpu=28.0% queue=109 done= 553 failed= 0 p95=568ms
+[ 342s] rss=  56.2MB cpu=27.2% queue=113 done= 570 failed= 0 p95=569ms
+[ 352s] rss=  38.1MB cpu=29.3% queue=117 done= 586 failed= 0 p95=569ms
+[ 362s] rss=  40.1MB cpu=27.1% queue=120 done= 603 failed= 0 p95=568ms
+[ 372s] rss=  42.2MB cpu=30.2% queue=124 done= 619 failed= 0 p95=568ms
+[ 382s] rss=  44.3MB cpu=31.2% queue=128 done= 635 failed= 0 p95=568ms
+[ 392s] rss=  46.6MB cpu=30.8% queue=131 done= 652 failed= 0 p95=568ms
+[ 402s] rss=  48.6MB cpu=30.5% queue=134 done= 669 failed= 0 p95=569ms
+[ 412s] rss=  50.7MB cpu=29.4% queue=138 done= 685 failed= 0 p95=569ms
+[ 422s] rss=  53.2MB cpu=28.5% queue=141 done= 702 failed= 0 p95=569ms
+[ 432s] rss=  55.3MB cpu=27.5% queue=145 done= 718 failed= 0 p95=569ms
+[ 442s] rss=  57.2MB cpu=28.4% queue=150 done= 733 failed= 0 p95=569ms
+[ 452s] rss=  38.9MB cpu=25.5% queue=155 done= 749 failed= 0 p95=570ms
+[ 462s] rss=  41.0MB cpu=24.9% queue=160 done= 765 failed= 0 p95=570ms
+[ 472s] rss=  43.0MB cpu=26.3% queue=164 done= 780 failed= 0 p95=570ms
+[ 482s] rss=  45.1MB cpu=26.2% queue=168 done= 796 failed= 0 p95=572ms
+{
+  "minutes": 8.0,
+  "rate": 2.0,
+  "workers": 2,
+  "submitted": 965,
+  "completed": 796,
+  "failed": 0,
+  "throughput_per_s": 1.66,
+  "rss_start_mb": 37.5,
+  "rss_end_mb": 45.1,
+  "rss_peak_mb": 57.2,
+  "rss_growth_mb": 7.6,
+  "max_queue": 168
+}
