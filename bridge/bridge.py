@@ -61,6 +61,9 @@ CHUNK = int(CFG.get("chunk_size", 1200))
 TASK_TIMEOUT = int(CFG.get("task_timeout_minutes", 45)) * 60
 HEARTBEAT_SEC = int(CFG.get("heartbeat_seconds", 60))
 MAX_QUEUE = int(CFG.get("max_queue", 5))
+# 单次任务输入 token 超过这个数就自动开新会话：--resume 会把整段历史重发一遍，
+# 会话越长每轮越贵，实测聊久了单次能到 200k token。
+SESSION_TOKEN_LIMIT = int(CFG.get("session_token_limit", 120000))
 WORKERS = max(1, int(CFG.get("workers", 1)))
 PANEL_PORT = int(CFG.get("panel_port", 3099))
 PANEL_TOKEN = str(CFG.get("panel_token", "") or "")
@@ -69,7 +72,7 @@ CONFIRM_TTL = 300
 
 START_TS = time.time()
 STATE = {"owner_uin": int(CFG.get("owner_uin", 0) or 0), "session_id": "", "cwd": WORKDIR,
-         "current_task": ""}
+         "current_task": "", "last_tokens_in": 0}
 COST_TOTAL = 0.0
 LAST_RESULT = ""
 STORE = TaskStore(DB_PATH)
@@ -382,8 +385,15 @@ async def _execute(row, cwd):
     audit(AUDIT_PATH, event="task_end", id=tid, source=row["source"], ok=ok,
           seconds=round(seconds, 1), cost_usd=round(cost, 6),
           tokens_in=tin, tokens_out=tout, result=(reply or "")[:2000])
-    log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s")
+    STATE["last_tokens_in"] = tin
+    log(f"任务结束 [{tid}]：success={ok} 用时 {seconds:.0f}s tokens={tin}+{tout}")
     await send(("✅ " if ok else "⚠️ ") + reply)
+    if WORKERS == 1 and tin > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
+        STATE["session_id"] = ""
+        save_state()
+        log(f"上下文自动重置：本次输入 {tin} token 超过上限 {SESSION_TOKEN_LIMIT}")
+        await send(f"🧹 本次任务读了 {tin / 1000:.0f}k token，已自动开新会话省成本。"
+                   f"需要接着上文的话，先发 /新会话 前的任务里说明背景。")
     _cleanup(tid)
 
 
@@ -820,6 +830,11 @@ async def main():
     rows = STORE.recover_interrupted()
     PENDING_NOTICES = [f"{r['id']} {r['text'][:60]}" for r in rows]
     STATE["current_task"] = ""
+    # 上次会话已经很贵了就别继续接力，直接开新的
+    if STATE.get("last_tokens_in", 0) > SESSION_TOKEN_LIMIT and STATE.get("session_id"):
+        log(f"启动时放弃旧会话（上次输入 {STATE['last_tokens_in']} token 超限）")
+        STATE["session_id"] = ""
+        STATE["last_tokens_in"] = 0
     save_state()
     for i in range(WORKERS):
         asyncio.create_task(worker(i))

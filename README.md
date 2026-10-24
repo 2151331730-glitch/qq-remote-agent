@@ -26,6 +26,7 @@
 | 不知道系统现在什么状态 | `/metrics`（Prometheus 文本）、`/api/state`（p50/p95、成功率）、审计 JSONL |
 | 一条命令把电脑搞崩 | 危险词/危险命令识别 → 先在 QQ 里要 `/确认`，5 分钟有效 |
 | 改了代码没生效 | 进程启动时间 vs 文件修改时间的自动校验（`restart-bridge.ps1`） |
+| `--resume` 越聊越贵（实测单次到 205k token） | 记录真实 token；超过 `session_token_limit` 自动开新会话，启动时也会丢弃超限的旧会话 |
 
 ## 快速开始
 

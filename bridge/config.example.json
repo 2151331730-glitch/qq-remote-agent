@@ -7,6 +7,7 @@
   "workdir": "C:\\Users\\<user>",
   "task_timeout_minutes": 45,
   "heartbeat_seconds": 60,
+  "session_token_limit": 120000,
   "max_queue": 5,
   "workers": 1,
   "chunk_size": 1200,
