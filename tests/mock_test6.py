@@ -24,7 +24,7 @@ cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
 cfg.update({"workdir": str(TMP),
             "claude_cmd": [sys.executable, str(ROOT / "tests" / "stub_claude.py")],
             "instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3003", "log_dir": str(LOG_DIR),
-            "owner_uin": 0, "panel_port": 3098, "db_path": str(TMP / "test6.db")})
+            "owner_uin": 12345, "panel_port": 3098, "db_path": str(TMP / "test6.db")})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 if STATE.exists():
     STATE.unlink()

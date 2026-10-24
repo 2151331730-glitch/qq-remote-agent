@@ -24,7 +24,7 @@ cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
             "workdir": str(TMP),
             "claude_cmd": [sys.executable, str(ROOT / "tests" / "stub_claude.py")],
             "instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
-            "owner_uin": 0, "panel_port": 3097, "db_path": str(DB)})
+            "owner_uin": 12345, "panel_port": 3097, "db_path": str(DB)})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 for p in (STATE, DB):
     if p.exists():
