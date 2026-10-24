@@ -430,7 +430,7 @@
 
 ### 验证
 
-- `pytest` → 112 passed, 12 skipped（新增 `test_context.py` 7 项、提示词顺序 2 项）。
+- `pytest` → 110 passed, 12 skipped（新增 `test_context.py` 7 项、提示词顺序 2 项）。
 - 端到端：mock 的 OneBot 现在会响应两个 history 接口，断言群聊/陌生私聊回复里都带上了
   "上下文"字样（stub 回显提示词前 40 字，说明摘录真的进了提示词）。全部通过。
 
