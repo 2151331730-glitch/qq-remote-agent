@@ -267,7 +267,8 @@ check(not any("Directory" in msg or "Volume" in msg for _, msg in PUBLIC_REPLIES
 # 群聊：@ 才回；只 @ 不说话也要有回音（否则看起来像没上线）
 check(len(GROUP_REPLIES) == 2, f"群聊应回复「@+文字」和「只 @」两条，实际 {GROUP_REPLIES}")
 check(any(msg.startswith("stub-ok") for _, msg in GROUP_REPLIES), "带文字的 @ 应走公开闲聊")
-check(any("直接说" in msg for _, msg in GROUP_REPLIES), "只 @ 不说话应回一句提示")
+check(any("直接说" in msg or msg.strip() in ("在呢", "嗯？咋了", "在的，说呗", "咋了")
+          for _, msg in GROUP_REPLIES), "只 @ 不说话应回一句自然的短话")
 check(all(gid == GROUP for gid, _ in GROUP_REPLIES), "群回复应发回原群")
 check(not any("人格设定" in msg for _, msg in GROUP_REPLIES), "群回复不能带主人的人格")
 # 上下文：回复前会拉历史，摘录应出现在提示词里（stub 回显前 40 字）

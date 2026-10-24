@@ -47,6 +47,7 @@
 | `bridge\context.py` | 把最近消息压成摘录（条数 / 每条字数 / 总长三重上限） |
 | `bridge\history.py` | 本地聊天记录（JSONL，`bridge\transcripts\`，私人内容不入库） |
 | `bridge\persona.md` | 人格设定，闲聊与任务共用；改完重启生效 |
+| `bridge\public_persona.md` | 公开通道（陌生人/群聊）的人格与拒绝规则；**每次调用都读，改完即时生效** |
 | `bridge\memory.py` | 长期记忆读写（纯文本，一行一条，超 4000 字丢最旧） |
 | `bridge\memory.md` | 长期记忆正文（**私人内容，不入库**；模板见 `memory.example.md`） |
 | `bridge\store.py` | **任务状态机 + 幂等 + 恢复**（SQLite WAL）：queued→running→succeeded/failed/cancelled/interrupted；`kind` 区分 task/chat |

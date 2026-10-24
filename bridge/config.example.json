@@ -35,6 +35,7 @@
   "public_workdir": "",
   "group_trigger_prefix": "",
   "public_system_prompt": "",
+  "public_persona_path": "",
   "context_enabled": true,
   "context_messages": 12,
   "context_max_chars": 1200,

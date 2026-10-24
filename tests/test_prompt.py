@@ -19,12 +19,15 @@ def _load(tmp_path, monkeypatch):
     cfg = json.loads((BRIDGE / "config.example.json").read_text(encoding="utf-8"))
     persona = tmp_path / "persona.md"
     persona.write_text("PERSONA-X 你是测试人格。", encoding="utf-8")
+    public_persona = tmp_path / "public_persona.md"
+    public_persona.write_text("PUBLIC-PERSONA 你只能聊天。", encoding="utf-8")
     mem = tmp_path / "memory.md"
     mem.write_text("# 标题行\n- 2026-10-24 该用户喜欢喝美式\n", encoding="utf-8")
     cfg.update({
         "claude_exe": "claude", "workdir": str(tmp_path), "log_dir": str(tmp_path / "logs"),
         "db_path": str(tmp_path / "t.db"), "persona_path": str(persona),
         "memory_path": str(mem), "chat_prompt_template": "",
+        "public_persona_path": str(public_persona),
         "task_prompt_template": "任务：{task}", "instance_lock_port": 0,
         "panel_port": 0, "owner_uin": 0,
     })
@@ -67,3 +70,15 @@ def test_task_prompt_ignores_history(tmp_path, monkeypatch):
     b = _load(tmp_path, monkeypatch)
     p = b.build_prompt("task", "帮我列目录", history="甲: 晚上吃啥")
     assert p == "任务：帮我列目录"
+
+
+def test_public_system_comes_from_file(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    assert b.load_public_system().startswith("PUBLIC-PERSONA")
+
+
+def test_public_system_falls_back_when_file_missing(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    b.PUBLIC_PERSONA_PATH = tmp_path / "missing.md"
+    text = b.load_public_system()
+    assert "只能聊天" in text and "PUBLIC-PERSONA" not in text
