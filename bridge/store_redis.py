@@ -23,6 +23,8 @@ import time
 import uuid
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 CLAIM_LUA = """
 local now = tonumber(ARGV[1])
@@ -54,12 +56,71 @@ TERMINAL = ("succeeded", "failed", "cancelled", "interrupted")
 
 
 class RedisStore:
-    def __init__(self, url="redis://127.0.0.1:6380/0", prefix="qq"):
+    def __init__(self, url="redis://127.0.0.1:6380/0", prefix="qq",
+                 sentinel_nodes=None, master_name="mymaster"):
+        """两种连法：
+        - 直连：url="redis://host:port/db"
+        - 哨兵：sentinel_nodes=[("127.0.0.1", 26380), ...] + master_name，
+          主库挂了哨兵会选新主，客户端下一次请求自动切过去。
+        """
         # protocol=2：redis-py 8 默认 RESP3（HELLO 3），Redis < 6.0 不认
-        self.r = redis.Redis.from_url(url, decode_responses=True, protocol=2)
+        self._sentinel_nodes = [tuple(n) for n in (sentinel_nodes or [])]
+        self._master_name = master_name
+        if self._sentinel_nodes:
+            # 不用 redis.sentinel.Sentinel：它不接受 protocol=2，会对 Redis 5 发 HELLO 3。
+            # 自己做"问哨兵要主库地址 → 直连"，断开时重新发现。
+            self._connect_master()
+        else:
+            self.r = redis.Redis.from_url(url, decode_responses=True, protocol=2,
+                                          socket_connect_timeout=1,
+                                          retry=Retry(NoBackoff(), 0))
         self.p = prefix
         self._claim = self.r.register_script(CLAIM_LUA)
         self.r.ping()
+
+    # ---------- 哨兵：主库发现与重连 ----------
+
+    def _discover_master(self):
+        last = None
+        for host, port in self._sentinel_nodes:
+            try:
+                s = redis.Redis(host=host, port=int(port), decode_responses=True,
+                                protocol=2, socket_timeout=2)
+                addr = s.execute_command("SENTINEL", "get-master-addr-by-name", self._master_name)
+                if addr:
+                    return addr[0], int(addr[1])
+            except Exception as e:
+                last = e
+        raise ConnectionError(f"哨兵都不可用: {last}")
+
+    def _connect_master(self):
+        host, port = self._discover_master()
+        self.master_addr = (host, port)
+        # 连接超时必须短：主库刚挂时，卡在死地址上会拖慢整个切换
+        # retry=0：关掉 redis-py 内置的指数退避（默认 3 次≈7s），
+        # 故障转移时由我们的 _resilient 立即重连，切换时间从 ~15s 降到 1s 级。
+        self.r = redis.Redis(host=host, port=port, decode_responses=True, protocol=2,
+                             socket_timeout=3, socket_connect_timeout=1,
+                             retry=Retry(NoBackoff(), 0), retry_on_timeout=False)
+        self._claim = self.r.register_script(CLAIM_LUA)
+
+    def _resilient(fn):  # noqa: N805（装饰器）
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+                if not self._sentinel_nodes:
+                    raise
+                # 主库挂了：重新问哨兵，再试一次
+                self._connect_master()
+                return fn(self, *args, **kwargs)
+            except redis.exceptions.ResponseError as e:
+                # 故障转移窗口里会短暂连到"已经降级为从库"的旧主，写操作报 READONLY
+                if not self._sentinel_nodes or "READONLY" not in str(e):
+                    raise
+                self._connect_master()
+                return fn(self, *args, **kwargs)
+        return wrapper
 
     # ---------- key 工具 ----------
     def _k(self, name):
@@ -341,3 +402,11 @@ def _pct(vals, p):
     vals = sorted(vals)
     k = max(0, min(len(vals) - 1, int(round((p / 100) * (len(vals) - 1)))))
     return int(vals[k])
+
+
+# 统一给公开方法加上"主库挂了就重新发现"的重连逻辑（放类外批量套，避免二十个装饰器）
+for _name in ("enqueue", "claim_next", "finish", "requeue", "cancel", "cancel_all_queued",
+              "recover_interrupted", "get", "queue_depth", "recent", "stats", "events",
+              "daily", "outbox_add", "outbox_pending", "outbox_mark", "outbox_pending_count",
+              "count_since", "tokens_since", "prune"):
+    setattr(RedisStore, _name, RedisStore._resilient(getattr(RedisStore, _name)))

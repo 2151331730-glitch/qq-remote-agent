@@ -71,6 +71,9 @@ MAX_TOKENS_PER_DAY = int(CFG.get("max_tokens_per_day", 2_000_000))
 RETENTION_DAYS = int(CFG.get("retention_days", 30))
 # 流式进度：把工具调用转发到 QQ，长任务不再只有"还在执行"
 STREAM_PROGRESS = bool(CFG.get("stream_progress", True))
+# agent 任务跑在哪：none = Windows 本体（默认）；wsl = 在 WSL 里跑 Linux 侧 CLI
+AGENT_SANDBOX = str(CFG.get("agent_sandbox") or "none").lower()
+AGENT_SANDBOX_CMD = list(CFG.get("agent_sandbox_cmd") or ["claude"])
 PROGRESS_MIN_INTERVAL = float(CFG.get("progress_min_interval", 15))
 WORKERS = max(1, int(CFG.get("workers", 1)))
 PANEL_PORT = int(CFG.get("panel_port", 3099))
@@ -88,8 +91,16 @@ STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
 if STORE_BACKEND == "redis":
     # 按需导入：用 SQLite 的环境不需要装 redis 包（CI 里也没装）
     from store_redis import RedisStore
-    STORE = RedisStore(os.environ.get("QQ_REMOTE_REDIS")
-                       or CFG.get("redis_url") or "redis://127.0.0.1:6380/0")
+    _sentinel = CFG.get("redis_sentinel")          # 例如 ["127.0.0.1:26380", ...]
+    if _sentinel:
+        STORE = RedisStore(
+            prefix=CFG.get("redis_prefix", "qq"),
+            sentinel_nodes=[tuple(x.split(":")) for x in _sentinel],
+            master_name=CFG.get("redis_master_name", "mymaster"))
+    else:
+        STORE = RedisStore(os.environ.get("QQ_REMOTE_REDIS")
+                           or CFG.get("redis_url") or "redis://127.0.0.1:6380/0",
+                           prefix=CFG.get("redis_prefix", "qq"))
 else:
     STORE = TaskStore(DB_PATH)
 WAKE = asyncio.Event()
@@ -257,6 +268,44 @@ def _describe_tool(block) -> str:
     return f"{name}: {detail}" if detail else str(name)
 
 
+def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: bool):
+    """把 agent 命令包进 WSL 执行。
+
+    提示词写文件再用 $(cat ...) 传，避免长中文提示在命令行里被转义搞坏。
+    """
+    import shlex
+    import tempfile
+    pf = Path(tempfile.gettempdir()) / f"qq-prompt-{task_id}.txt"
+    pf.write_text(prompt, encoding="utf-8")
+    inner = " ".join(shlex.quote(x) for x in AGENT_SANDBOX_CMD)
+    inner += ' -p "$(cat ' + shlex.quote(sandbox._win_to_wsl(str(pf))) + ')"'
+    inner += f" --output-format {shlex.quote(fmt)}"
+    if fmt == "stream-json":
+        inner += " --verbose"
+    inner += " --dangerously-skip-permissions"
+    if use_resume and STATE.get("session_id"):
+        inner += " --resume " + shlex.quote(STATE["session_id"])
+    return ["wsl", "-e", "bash", "-lc",
+            f"cd {shlex.quote(sandbox._win_to_wsl(cwd))} && {inner}"]
+
+
+def check_agent_sandbox() -> bool:
+    """启动时确认 WSL 里真的能调到 agent 命令，避免每条任务都失败才发现。"""
+    if AGENT_SANDBOX != "wsl":
+        return True
+    import shlex
+    try:
+        r = subprocess.run(["wsl", "-e", "bash", "-lc",
+                            "command -v " + shlex.quote(AGENT_SANDBOX_CMD[0])],
+                           capture_output=True, timeout=20)
+        ok = r.returncode == 0
+    except Exception:
+        ok = False
+    log("agent 沙箱 wsl " + ("可用" if ok else
+                             f"不可用：WSL 里找不到 {AGENT_SANDBOX_CMD[0]}，任务会失败"))
+    return ok
+
+
 async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
     """跑一次 claude -p。
 
@@ -272,13 +321,16 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None):
         # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
         base = list(CFG.get("claude_cmd") or [CLAUDE])
         fmt = "stream-json" if STREAM_PROGRESS else "json"
-        args = base + ["-p", prompt, "--output-format", fmt,
-                       "--dangerously-skip-permissions"]
-        if STREAM_PROGRESS:
-            args.append("--verbose")
-        if use_resume and use_session and STATE.get("session_id"):
-            args += ["--resume", STATE["session_id"]]
-        env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        if AGENT_SANDBOX == "wsl":
+            args = _wsl_agent_argv(prompt, cwd, fmt, task_id, use_resume and use_session)
+        else:
+            args = base + ["-p", prompt, "--output-format", fmt,
+                           "--dangerously-skip-permissions"]
+            if STREAM_PROGRESS:
+                args.append("--verbose")
+            if use_resume and use_session and STATE.get("session_id"):
+                args += ["--resume", STATE["session_id"]]
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", WSL_UTF8="1")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=cwd, stdout=asyncio.subprocess.PIPE,
@@ -981,6 +1033,7 @@ async def main():
         log("已有 bridge 实例在跑（实例锁被占），本进程退出")
         return
     load_state()
+    check_agent_sandbox()
     # 上次崩溃/重启时还在跑的任务：标 interrupted 并准备通知
     rows = STORE.recover_interrupted()
     PENDING_NOTICES = [f"{r['id']} {r['text'][:60]}" for r in rows]

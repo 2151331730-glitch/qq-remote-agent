@@ -18,8 +18,11 @@ DB = TMP / "test5.db"
 LOG_DIR = TMP / "logs5"
 LOG_DIR.mkdir(exist_ok=True)
 
-cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
-cfg.update({"instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
+base_name = "config.json" if (ROOT / "bridge" / "config.json").exists() else "config.example.json"
+cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
+cfg.update({"workdir": str(TMP),
+            "claude_cmd": [sys.executable, str(ROOT / "tests" / "stub_claude.py")],
+            "instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3002", "log_dir": str(LOG_DIR),
             "owner_uin": 0, "panel_port": 3097, "db_path": str(DB)})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 for p in (STATE, DB):
@@ -97,3 +100,9 @@ import sqlite3  # noqa: E402
 c = sqlite3.connect(DB)
 for row in c.execute("SELECT id, state, source, substr(text,1,24) FROM tasks ORDER BY created_at"):
     print(row)
+
+# ---- 断言（CI 用）：幂等 + 执行成功 ----
+rows = list(c.execute("SELECT id, state, tokens_in FROM tasks"))
+assert len(rows) == 1, f"期望 1 条任务（重复投递应被幂等丢弃），实际 {len(rows)}"
+assert rows[0][1] == "succeeded", f"任务状态应为 succeeded，实际 {rows[0][1]}"
+print("\n✅ 断言通过：1 条任务、succeeded、重复投递被丢弃")

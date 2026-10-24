@@ -19,8 +19,11 @@ LOG_DIR = TMP / "logs6"
 LOG_DIR.mkdir(exist_ok=True)
 PANEL = "http://127.0.0.1:3098"
 
-cfg = json.loads((ROOT / "bridge" / "config.json").read_text(encoding="utf-8"))
-cfg.update({"instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3003", "log_dir": str(LOG_DIR),
+base_name = "config.json" if (ROOT / "bridge" / "config.json").exists() else "config.example.json"
+cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
+cfg.update({"workdir": str(TMP),
+            "claude_cmd": [sys.executable, str(ROOT / "tests" / "stub_claude.py")],
+            "instance_lock_port": 0,"napcat_ws": "ws://127.0.0.1:3003", "log_dir": str(LOG_DIR),
             "owner_uin": 0, "panel_port": 3098, "db_path": str(TMP / "test6.db")})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 if STATE.exists():
@@ -137,10 +140,15 @@ async def main():
 
         print("\n=== 断言 ===", flush=True)
         joined = "\n".join(REPLIES)
-        print("危险任务被拦下:", "回复 /确认" in joined)
-        print("取消生效:", "已取消待确认" in joined)
-        print("确认后执行命令:", "已确认执行命令" in joined)
-        print("可见审计文件:", (LOG_DIR / "audit.jsonl").exists())
+        checks = {
+            "危险任务被拦下": "回复 /确认" in joined,
+            "取消生效": "已取消待确认" in joined,
+            "确认后执行命令": "已确认执行命令" in joined,
+            "可见审计文件": (LOG_DIR / "audit.jsonl").exists(),
+        }
+        for k, v in checks.items():
+            print(f"  {k}: {v}")
+        assert all(checks.values()), f"失败项: {[k for k, v in checks.items() if not v]}"
 
 
 asyncio.run(main())

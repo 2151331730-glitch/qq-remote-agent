@@ -18,6 +18,7 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 import time
 import uuid
 from pathlib import Path
@@ -77,7 +78,7 @@ class TaskStore:
     def __init__(self, path):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._conn() as c:
+        with self._db() as c:
             c.executescript(SCHEMA)
             self._migrate(c)
 
@@ -98,6 +99,17 @@ class TaskStore:
         c.execute("PRAGMA synchronous=NORMAL")
         return c
 
+    @contextmanager
+    def _db(self):
+        """真正关闭连接的上下文：`with conn:` 只提交事务，不会 close，
+        长跑时连接和内存会随请求数累积（压测里 RSS 8 分钟涨 16MB 就是它）。"""
+        c = self._conn()
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
     # ---------- 写入 ----------
 
     def enqueue(self, text, source="qq", sender=None, dedup_key=None,
@@ -105,7 +117,7 @@ class TaskStore:
         """入队。dedup_key 重复时返回 (已有 task_id, True)。"""
         now = time.time()
         tid = uuid.uuid4().hex[:12]
-        with self._conn() as c:
+        with self._db() as c:
             try:
                 c.execute(
                     "INSERT INTO tasks(id, source, sender, dedup_key, text, state,"
@@ -133,7 +145,7 @@ class TaskStore:
             marks = ",".join("?" * len(exclude))
             where += f" AND (cwd IS NULL OR cwd NOT IN ({marks}))"
             params = [now] + exclude
-        with self._conn() as c:
+        with self._db() as c:
             row = c.execute(
                 "UPDATE tasks SET state='running', started_at=?, attempts=attempts+1"
                 f" WHERE id = (SELECT id FROM tasks WHERE {where}"
@@ -146,7 +158,7 @@ class TaskStore:
             return dict(row)
 
     def requeue(self, task_id):
-        with self._conn() as c:
+        with self._db() as c:
             c.execute("UPDATE tasks SET state='queued', started_at=NULL WHERE id=? AND state='running'",
                       (task_id,))
 
@@ -154,7 +166,7 @@ class TaskStore:
                cost_usd=0.0, duration_ms=None, tokens_in=0, tokens_out=0, error_kind=None):
         assert state in TERMINAL, state
         now = time.time()
-        with self._conn() as c:
+        with self._db() as c:
             row = c.execute("SELECT started_at FROM tasks WHERE id=?", (task_id,)).fetchone()
             if duration_ms is None and row and row["started_at"]:
                 duration_ms = int((now - row["started_at"]) * 1000)
@@ -171,7 +183,7 @@ class TaskStore:
 
     def cancel(self, task_id):
         """取消一条 queued 任务；返回是否真的取消了。"""
-        with self._conn() as c:
+        with self._db() as c:
             cur = c.execute("UPDATE tasks SET state='cancelled', finished_at=?"
                             " WHERE id=? AND state='queued'", (time.time(), task_id))
             if cur.rowcount:
@@ -180,7 +192,7 @@ class TaskStore:
             return bool(cur.rowcount)
 
     def cancel_all_queued(self):
-        with self._conn() as c:
+        with self._db() as c:
             ids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE state='queued'")]
             if ids:
                 now = time.time()
@@ -193,7 +205,7 @@ class TaskStore:
     def recover_interrupted(self):
         """启动时调用：把上次残留的 running 标成 interrupted，返回这些任务。"""
         now = time.time()
-        with self._conn() as c:
+        with self._db() as c:
             rows = [dict(r) for r in c.execute("SELECT * FROM tasks WHERE state='running'")]
             if rows:
                 c.executemany("UPDATE tasks SET state='interrupted', finished_at=? WHERE id=?",
@@ -205,23 +217,23 @@ class TaskStore:
     # ---------- 读取 ----------
 
     def get(self, task_id):
-        with self._conn() as c:
+        with self._db() as c:
             row = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             return dict(row) if row else None
 
     def queue_depth(self):
-        with self._conn() as c:
+        with self._db() as c:
             return c.execute("SELECT COUNT(*) n FROM tasks WHERE state='queued'").fetchone()["n"]
 
     def recent(self, limit=30):
-        with self._conn() as c:
+        with self._db() as c:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,))]
 
     def stats(self, since_hours=24):
         """总览 + 最近窗口内的时延分位数。"""
         since = time.time() - since_hours * 3600
-        with self._conn() as c:
+        with self._db() as c:
             counts = {r["state"]: r["n"] for r in c.execute(
                 "SELECT state, COUNT(*) n FROM tasks GROUP BY state")}
             agg = c.execute(
@@ -257,7 +269,7 @@ class TaskStore:
         }
 
     def events(self, limit=100, task_id=None):
-        with self._conn() as c:
+        with self._db() as c:
             if task_id:
                 rows = c.execute("SELECT * FROM events WHERE task_id=? ORDER BY ts DESC LIMIT ?",
                                  (task_id, limit))
@@ -268,18 +280,18 @@ class TaskStore:
     # ---------- 发件箱（结果投递可靠性） ----------
 
     def outbox_add(self, body, task_id=None):
-        with self._conn() as c:
+        with self._db() as c:
             cur = c.execute("INSERT INTO outbox(created_at, task_id, body) VALUES(?,?,?)",
                             (time.time(), task_id, body))
             return cur.lastrowid
 
     def outbox_pending(self, limit=20):
-        with self._conn() as c:
+        with self._db() as c:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM outbox WHERE delivered_at IS NULL ORDER BY id LIMIT ?", (limit,))]
 
     def outbox_mark(self, oid, ok, error=None):
-        with self._conn() as c:
+        with self._db() as c:
             if ok:
                 c.execute("UPDATE outbox SET delivered_at=?, attempts=attempts+1 WHERE id=?",
                           (time.time(), oid))
@@ -288,18 +300,18 @@ class TaskStore:
                           ((error or "")[:300], oid))
 
     def outbox_pending_count(self):
-        with self._conn() as c:
+        with self._db() as c:
             return c.execute("SELECT COUNT(*) n FROM outbox WHERE delivered_at IS NULL").fetchone()["n"]
 
     # ---------- 额度 ----------
 
     def count_since(self, seconds):
-        with self._conn() as c:
+        with self._db() as c:
             return c.execute("SELECT COUNT(*) n FROM tasks WHERE created_at>=?",
                              (time.time() - seconds,)).fetchone()["n"]
 
     def tokens_since(self, seconds):
-        with self._conn() as c:
+        with self._db() as c:
             return c.execute("SELECT COALESCE(SUM(tokens_in+tokens_out),0) v FROM tasks"
                              " WHERE created_at>=?", (time.time() - seconds,)).fetchone()["v"]
 
@@ -308,7 +320,7 @@ class TaskStore:
     def prune(self, days=30):
         """删掉过期的终态任务与事件；返回删除条数。"""
         cutoff = time.time() - days * 86400
-        with self._conn() as c:
+        with self._db() as c:
             n1 = c.execute("DELETE FROM tasks WHERE state IN ('succeeded','failed','cancelled',"
                            "'interrupted') AND COALESCE(finished_at, created_at)<?",
                            (cutoff,)).rowcount
@@ -327,7 +339,7 @@ class TaskStore:
 
     def daily(self, days=7):
         since = time.time() - days * 86400
-        with self._conn() as c:
+        with self._db() as c:
             rows = c.execute(
                 "SELECT date(created_at,'unixepoch','localtime') d,"
                 "       COUNT(*) n,"

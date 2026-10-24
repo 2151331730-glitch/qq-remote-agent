@@ -1,0 +1,62 @@
+[  10s] rss=  40.4MB cpu= 0.0% queue=  2 done=  18 failed= 0 p95=549ms
+[  20s] rss=  43.3MB cpu=14.8% queue=  3 done=  37 failed= 0 p95=545ms
+[  30s] rss=  46.0MB cpu=14.3% queue=  5 done=  55 failed= 0 p95=548ms
+[  40s] rss=  41.8MB cpu=11.9% queue=  6 done=  74 failed= 0 p95=545ms
+[  50s] rss=  45.4MB cpu=14.6% queue=  7 done=  93 failed= 0 p95=543ms
+[  60s] rss=  46.9MB cpu=12.6% queue=  9 done= 111 failed= 0 p95=542ms
+[  70s] rss=  43.7MB cpu=15.4% queue= 10 done= 130 failed= 0 p95=548ms
+[  80s] rss=  46.1MB cpu=14.2% queue= 12 done= 148 failed= 0 p95=548ms
+[  90s] rss=  47.9MB cpu=12.2% queue= 14 done= 166 failed= 0 p95=548ms
+[ 100s] rss=  44.3MB cpu=13.7% queue= 15 done= 185 failed= 0 p95=551ms
+[ 110s] rss=  45.1MB cpu=13.9% queue= 17 done= 203 failed= 0 p95=549ms
+[ 120s] rss=  46.8MB cpu=15.9% queue= 19 done= 221 failed= 0 p95=551ms
+[ 130s] rss=  43.6MB cpu=15.9% queue= 21 done= 239 failed= 0 p95=551ms
+[ 140s] rss=  45.9MB cpu=12.9% queue= 22 done= 258 failed= 0 p95=551ms
+[ 150s] rss=  60.9MB cpu=16.5% queue= 24 done= 276 failed= 0 p95=551ms
+[ 160s] rss=  45.6MB cpu=13.4% queue= 26 done= 294 failed= 0 p95=551ms
+[ 170s] rss=  60.5MB cpu=15.9% queue= 27 done= 313 failed= 0 p95=551ms
+[ 180s] rss=  48.9MB cpu=14.7% queue= 29 done= 331 failed= 0 p95=551ms
+[ 190s] rss=  46.9MB cpu=15.9% queue= 31 done= 349 failed= 0 p95=551ms
+[ 200s] rss=  60.7MB cpu=12.8% queue= 32 done= 368 failed= 0 p95=552ms
+[ 211s] rss=  61.4MB cpu=12.5% queue= 34 done= 386 failed= 0 p95=552ms
+[ 221s] rss=  48.0MB cpu=17.1% queue= 37 done= 404 failed= 0 p95=552ms
+[ 231s] rss=  60.9MB cpu=13.7% queue= 39 done= 422 failed= 0 p95=551ms
+[ 241s] rss=  61.7MB cpu=11.8% queue= 41 done= 440 failed= 0 p95=551ms
+[ 251s] rss=  49.0MB cpu=17.1% queue= 42 done= 459 failed= 0 p95=551ms
+[ 261s] rss=  60.4MB cpu=13.4% queue= 44 done= 477 failed= 0 p95=551ms
+[ 271s] rss=  63.1MB cpu=15.3% queue= 46 done= 495 failed= 0 p95=551ms
+[ 281s] rss=  63.9MB cpu=13.9% queue= 48 done= 513 failed= 0 p95=552ms
+[ 291s] rss=  59.6MB cpu=10.9% queue= 49 done= 532 failed= 0 p95=551ms
+[ 301s] rss=  61.6MB cpu=13.1% queue= 51 done= 550 failed= 0 p95=551ms
+[ 311s] rss=  53.4MB cpu=14.0% queue= 52 done= 569 failed= 0 p95=551ms
+[ 321s] rss=  60.4MB cpu=12.0% queue= 54 done= 587 failed= 0 p95=551ms
+[ 331s] rss=  62.1MB cpu=11.5% queue= 56 done= 605 failed= 0 p95=551ms
+[ 341s] rss=  62.0MB cpu=12.6% queue= 57 done= 624 failed= 0 p95=551ms
+[ 351s] rss=  62.0MB cpu=12.9% queue= 59 done= 642 failed= 0 p95=551ms
+[ 361s] rss=  52.7MB cpu=15.7% queue= 60 done= 661 failed= 0 p95=551ms
+[ 371s] rss=  63.5MB cpu=13.4% queue= 62 done= 679 failed= 0 p95=552ms
+[ 381s] rss=  61.5MB cpu=12.1% queue= 63 done= 697 failed= 0 p95=552ms
+[ 391s] rss=  62.9MB cpu=14.6% queue= 65 done= 716 failed= 0 p95=552ms
+[ 401s] rss=  64.6MB cpu=12.2% queue= 68 done= 734 failed= 0 p95=552ms
+[ 411s] rss=  63.6MB cpu=13.7% queue= 70 done= 752 failed= 0 p95=552ms
+[ 421s] rss=  63.7MB cpu=15.1% queue= 71 done= 771 failed= 0 p95=552ms
+[ 431s] rss=  64.0MB cpu=12.0% queue= 73 done= 789 failed= 0 p95=552ms
+[ 441s] rss=  62.5MB cpu=10.4% queue= 74 done= 808 failed= 0 p95=552ms
+[ 451s] rss=  63.3MB cpu=13.1% queue= 76 done= 826 failed= 0 p95=552ms
+[ 461s] rss=  64.1MB cpu=13.9% queue= 78 done= 844 failed= 0 p95=552ms
+[ 471s] rss=  54.9MB cpu=15.1% queue= 79 done= 863 failed= 0 p95=552ms
+[ 481s] rss=  63.1MB cpu=13.1% queue= 81 done= 881 failed= 0 p95=552ms
+{
+  "minutes": 8.0,
+  "rate": 2.0,
+  "workers": 2,
+  "submitted": 963,
+  "completed": 881,
+  "failed": 0,
+  "throughput_per_s": 1.84,
+  "rss_start_mb": 40.4,
+  "rss_end_mb": 63.1,
+  "rss_peak_mb": 64.6,
+  "rss_growth_mb": 22.7,
+  "max_queue": 81
+}

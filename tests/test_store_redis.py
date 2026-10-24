@@ -3,22 +3,29 @@
 
 用独立 db 15，测试前后 flush，不会碰到正在跑的生产队列。
 """
+import os
+
 import pytest
 
 redis = pytest.importorskip("redis")
 
-URL = "redis://127.0.0.1:6380/15"
+# 可用 QQ_TEST_REDIS_URL 指向当前主库（哨兵环境里主库会漂移）
+URL = os.environ.get("QQ_TEST_REDIS_URL", "redis://127.0.0.1:6380/15")
 
 
 def _available():
+    """能连上并且是主库才算可用（哨兵环境里 URL 可能指向已降级的旧主）。"""
     try:
-        redis.Redis.from_url(URL, decode_responses=True, protocol=2).ping()
-        return True
+        c = redis.Redis.from_url(URL, decode_responses=True, protocol=2)
+        c.ping()
+        role = c.execute_command("ROLE")
+        return isinstance(role, list) and role and role[0] == "master"
     except Exception:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _available(), reason="本机没有 Redis（127.0.0.1:6380）")
+pytestmark = pytest.mark.skipif(not _available(),
+                                reason="没有可写的主库 Redis（用 QQ_TEST_REDIS_URL 指定）")
 
 
 @pytest.fixture()

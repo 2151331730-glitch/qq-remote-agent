@@ -1,0 +1,496 @@
+{
+  "minutes": 8.0,
+  "rate": 2.0,
+  "workers": 2,
+  "submitted": 963,
+  "completed": 881,
+  "failed": 0,
+  "throughput_per_s": 1.84,
+  "rss_start_mb": 40.4,
+  "rss_end_mb": 63.1,
+  "rss_peak_mb": 64.6,
+  "rss_growth_mb": 22.7,
+  "max_queue": 81,
+  "samples": [
+    {
+      "t": 10,
+      "rss_mb": 40.4,
+      "cpu": 0.0,
+      "queue": 2,
+      "done": 18,
+      "failed": 0,
+      "p95_ms": 549,
+      "sent": 21
+    },
+    {
+      "t": 20,
+      "rss_mb": 43.3,
+      "cpu": 14.8,
+      "queue": 3,
+      "done": 37,
+      "failed": 0,
+      "p95_ms": 545,
+      "sent": 41
+    },
+    {
+      "t": 30,
+      "rss_mb": 46.0,
+      "cpu": 14.3,
+      "queue": 5,
+      "done": 55,
+      "failed": 0,
+      "p95_ms": 548,
+      "sent": 61
+    },
+    {
+      "t": 40,
+      "rss_mb": 41.8,
+      "cpu": 11.9,
+      "queue": 6,
+      "done": 74,
+      "failed": 0,
+      "p95_ms": 545,
+      "sent": 81
+    },
+    {
+      "t": 50,
+      "rss_mb": 45.4,
+      "cpu": 14.6,
+      "queue": 7,
+      "done": 93,
+      "failed": 0,
+      "p95_ms": 543,
+      "sent": 101
+    },
+    {
+      "t": 60,
+      "rss_mb": 46.9,
+      "cpu": 12.6,
+      "queue": 9,
+      "done": 111,
+      "failed": 0,
+      "p95_ms": 542,
+      "sent": 121
+    },
+    {
+      "t": 70,
+      "rss_mb": 43.7,
+      "cpu": 15.4,
+      "queue": 10,
+      "done": 130,
+      "failed": 0,
+      "p95_ms": 548,
+      "sent": 141
+    },
+    {
+      "t": 80,
+      "rss_mb": 46.1,
+      "cpu": 14.2,
+      "queue": 12,
+      "done": 148,
+      "failed": 0,
+      "p95_ms": 548,
+      "sent": 161
+    },
+    {
+      "t": 90,
+      "rss_mb": 47.9,
+      "cpu": 12.2,
+      "queue": 14,
+      "done": 166,
+      "failed": 0,
+      "p95_ms": 548,
+      "sent": 181
+    },
+    {
+      "t": 100,
+      "rss_mb": 44.3,
+      "cpu": 13.7,
+      "queue": 15,
+      "done": 185,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 201
+    },
+    {
+      "t": 110,
+      "rss_mb": 45.1,
+      "cpu": 13.9,
+      "queue": 17,
+      "done": 203,
+      "failed": 0,
+      "p95_ms": 549,
+      "sent": 221
+    },
+    {
+      "t": 120,
+      "rss_mb": 46.8,
+      "cpu": 15.9,
+      "queue": 19,
+      "done": 221,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 241
+    },
+    {
+      "t": 130,
+      "rss_mb": 43.6,
+      "cpu": 15.9,
+      "queue": 21,
+      "done": 239,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 261
+    },
+    {
+      "t": 140,
+      "rss_mb": 45.9,
+      "cpu": 12.9,
+      "queue": 22,
+      "done": 258,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 281
+    },
+    {
+      "t": 150,
+      "rss_mb": 60.9,
+      "cpu": 16.5,
+      "queue": 24,
+      "done": 276,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 301
+    },
+    {
+      "t": 160,
+      "rss_mb": 45.6,
+      "cpu": 13.4,
+      "queue": 26,
+      "done": 294,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 321
+    },
+    {
+      "t": 170,
+      "rss_mb": 60.5,
+      "cpu": 15.9,
+      "queue": 27,
+      "done": 313,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 341
+    },
+    {
+      "t": 180,
+      "rss_mb": 48.9,
+      "cpu": 14.7,
+      "queue": 29,
+      "done": 331,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 361
+    },
+    {
+      "t": 190,
+      "rss_mb": 46.9,
+      "cpu": 15.9,
+      "queue": 31,
+      "done": 349,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 381
+    },
+    {
+      "t": 200,
+      "rss_mb": 60.7,
+      "cpu": 12.8,
+      "queue": 32,
+      "done": 368,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 401
+    },
+    {
+      "t": 211,
+      "rss_mb": 61.4,
+      "cpu": 12.5,
+      "queue": 34,
+      "done": 386,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 421
+    },
+    {
+      "t": 221,
+      "rss_mb": 48.0,
+      "cpu": 17.1,
+      "queue": 37,
+      "done": 404,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 442
+    },
+    {
+      "t": 231,
+      "rss_mb": 60.9,
+      "cpu": 13.7,
+      "queue": 39,
+      "done": 422,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 462
+    },
+    {
+      "t": 241,
+      "rss_mb": 61.7,
+      "cpu": 11.8,
+      "queue": 41,
+      "done": 440,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 482
+    },
+    {
+      "t": 251,
+      "rss_mb": 49.0,
+      "cpu": 17.1,
+      "queue": 42,
+      "done": 459,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 502
+    },
+    {
+      "t": 261,
+      "rss_mb": 60.4,
+      "cpu": 13.4,
+      "queue": 44,
+      "done": 477,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 522
+    },
+    {
+      "t": 271,
+      "rss_mb": 63.1,
+      "cpu": 15.3,
+      "queue": 46,
+      "done": 495,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 542
+    },
+    {
+      "t": 281,
+      "rss_mb": 63.9,
+      "cpu": 13.9,
+      "queue": 48,
+      "done": 513,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 562
+    },
+    {
+      "t": 291,
+      "rss_mb": 59.6,
+      "cpu": 10.9,
+      "queue": 49,
+      "done": 532,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 582
+    },
+    {
+      "t": 301,
+      "rss_mb": 61.6,
+      "cpu": 13.1,
+      "queue": 51,
+      "done": 550,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 602
+    },
+    {
+      "t": 311,
+      "rss_mb": 53.4,
+      "cpu": 14.0,
+      "queue": 52,
+      "done": 569,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 622
+    },
+    {
+      "t": 321,
+      "rss_mb": 60.4,
+      "cpu": 12.0,
+      "queue": 54,
+      "done": 587,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 642
+    },
+    {
+      "t": 331,
+      "rss_mb": 62.1,
+      "cpu": 11.5,
+      "queue": 56,
+      "done": 605,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 662
+    },
+    {
+      "t": 341,
+      "rss_mb": 62.0,
+      "cpu": 12.6,
+      "queue": 57,
+      "done": 624,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 682
+    },
+    {
+      "t": 351,
+      "rss_mb": 62.0,
+      "cpu": 12.9,
+      "queue": 59,
+      "done": 642,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 702
+    },
+    {
+      "t": 361,
+      "rss_mb": 52.7,
+      "cpu": 15.7,
+      "queue": 60,
+      "done": 661,
+      "failed": 0,
+      "p95_ms": 551,
+      "sent": 722
+    },
+    {
+      "t": 371,
+      "rss_mb": 63.5,
+      "cpu": 13.4,
+      "queue": 62,
+      "done": 679,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 742
+    },
+    {
+      "t": 381,
+      "rss_mb": 61.5,
+      "cpu": 12.1,
+      "queue": 63,
+      "done": 697,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 762
+    },
+    {
+      "t": 391,
+      "rss_mb": 62.9,
+      "cpu": 14.6,
+      "queue": 65,
+      "done": 716,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 782
+    },
+    {
+      "t": 401,
+      "rss_mb": 64.6,
+      "cpu": 12.2,
+      "queue": 68,
+      "done": 734,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 803
+    },
+    {
+      "t": 411,
+      "rss_mb": 63.6,
+      "cpu": 13.7,
+      "queue": 70,
+      "done": 752,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 823
+    },
+    {
+      "t": 421,
+      "rss_mb": 63.7,
+      "cpu": 15.1,
+      "queue": 71,
+      "done": 771,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 843
+    },
+    {
+      "t": 431,
+      "rss_mb": 64.0,
+      "cpu": 12.0,
+      "queue": 73,
+      "done": 789,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 863
+    },
+    {
+      "t": 441,
+      "rss_mb": 62.5,
+      "cpu": 10.4,
+      "queue": 74,
+      "done": 808,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 883
+    },
+    {
+      "t": 451,
+      "rss_mb": 63.3,
+      "cpu": 13.1,
+      "queue": 76,
+      "done": 826,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 903
+    },
+    {
+      "t": 461,
+      "rss_mb": 64.1,
+      "cpu": 13.9,
+      "queue": 78,
+      "done": 844,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 923
+    },
+    {
+      "t": 471,
+      "rss_mb": 54.9,
+      "cpu": 15.1,
+      "queue": 79,
+      "done": 863,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 943
+    },
+    {
+      "t": 481,
+      "rss_mb": 63.1,
+      "cpu": 13.1,
+      "queue": 81,
+      "done": 881,
+      "failed": 0,
+      "p95_ms": 552,
+      "sent": 963
+    }
+  ]
+}

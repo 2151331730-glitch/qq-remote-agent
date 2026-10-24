@@ -1,0 +1,256 @@
+{
+  "minutes": 4.0,
+  "rate": 2.0,
+  "workers": 2,
+  "submitted": 483,
+  "completed": 400,
+  "failed": 0,
+  "throughput_per_s": 1.67,
+  "rss_start_mb": 37.5,
+  "rss_end_mb": 54.7,
+  "rss_peak_mb": 54.7,
+  "rss_growth_mb": 17.2,
+  "max_queue": 82,
+  "samples": [
+    {
+      "t": 10,
+      "rss_mb": 37.5,
+      "cpu": 0.0,
+      "queue": 3,
+      "done": 17,
+      "failed": 0,
+      "p95_ms": 549,
+      "sent": 21
+    },
+    {
+      "t": 20,
+      "rss_mb": 39.8,
+      "cpu": 27.0,
+      "queue": 5,
+      "done": 35,
+      "failed": 0,
+      "p95_ms": 549,
+      "sent": 41
+    },
+    {
+      "t": 30,
+      "rss_mb": 42.0,
+      "cpu": 25.0,
+      "queue": 8,
+      "done": 52,
+      "failed": 0,
+      "p95_ms": 553,
+      "sent": 61
+    },
+    {
+      "t": 40,
+      "rss_mb": 44.2,
+      "cpu": 26.3,
+      "queue": 11,
+      "done": 69,
+      "failed": 0,
+      "p95_ms": 553,
+      "sent": 81
+    },
+    {
+      "t": 50,
+      "rss_mb": 46.4,
+      "cpu": 24.3,
+      "queue": 14,
+      "done": 86,
+      "failed": 0,
+      "p95_ms": 554,
+      "sent": 101
+    },
+    {
+      "t": 60,
+      "rss_mb": 48.7,
+      "cpu": 26.7,
+      "queue": 17,
+      "done": 103,
+      "failed": 0,
+      "p95_ms": 561,
+      "sent": 121
+    },
+    {
+      "t": 70,
+      "rss_mb": 37.3,
+      "cpu": 24.1,
+      "queue": 21,
+      "done": 119,
+      "failed": 0,
+      "p95_ms": 562,
+      "sent": 141
+    },
+    {
+      "t": 80,
+      "rss_mb": 39.5,
+      "cpu": 29.7,
+      "queue": 24,
+      "done": 136,
+      "failed": 0,
+      "p95_ms": 561,
+      "sent": 161
+    },
+    {
+      "t": 90,
+      "rss_mb": 41.5,
+      "cpu": 26.6,
+      "queue": 27,
+      "done": 153,
+      "failed": 0,
+      "p95_ms": 560,
+      "sent": 181
+    },
+    {
+      "t": 100,
+      "rss_mb": 43.7,
+      "cpu": 27.1,
+      "queue": 31,
+      "done": 169,
+      "failed": 0,
+      "p95_ms": 561,
+      "sent": 201
+    },
+    {
+      "t": 110,
+      "rss_mb": 45.8,
+      "cpu": 26.6,
+      "queue": 34,
+      "done": 186,
+      "failed": 0,
+      "p95_ms": 562,
+      "sent": 221
+    },
+    {
+      "t": 121,
+      "rss_mb": 47.8,
+      "cpu": 27.4,
+      "queue": 38,
+      "done": 202,
+      "failed": 0,
+      "p95_ms": 563,
+      "sent": 241
+    },
+    {
+      "t": 131,
+      "rss_mb": 49.9,
+      "cpu": 28.0,
+      "queue": 43,
+      "done": 218,
+      "failed": 0,
+      "p95_ms": 564,
+      "sent": 262
+    },
+    {
+      "t": 141,
+      "rss_mb": 51.9,
+      "cpu": 24.7,
+      "queue": 46,
+      "done": 235,
+      "failed": 0,
+      "p95_ms": 564,
+      "sent": 282
+    },
+    {
+      "t": 151,
+      "rss_mb": 54.1,
+      "cpu": 26.9,
+      "queue": 49,
+      "done": 252,
+      "failed": 0,
+      "p95_ms": 565,
+      "sent": 301
+    },
+    {
+      "t": 161,
+      "rss_mb": 37.6,
+      "cpu": 30.5,
+      "queue": 53,
+      "done": 268,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 322
+    },
+    {
+      "t": 171,
+      "rss_mb": 39.6,
+      "cpu": 28.0,
+      "queue": 56,
+      "done": 285,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 342
+    },
+    {
+      "t": 181,
+      "rss_mb": 41.6,
+      "cpu": 28.5,
+      "queue": 60,
+      "done": 301,
+      "failed": 0,
+      "p95_ms": 568,
+      "sent": 362
+    },
+    {
+      "t": 191,
+      "rss_mb": 43.7,
+      "cpu": 28.6,
+      "queue": 64,
+      "done": 317,
+      "failed": 0,
+      "p95_ms": 568,
+      "sent": 382
+    },
+    {
+      "t": 201,
+      "rss_mb": 45.9,
+      "cpu": 27.4,
+      "queue": 67,
+      "done": 334,
+      "failed": 0,
+      "p95_ms": 568,
+      "sent": 402
+    },
+    {
+      "t": 211,
+      "rss_mb": 48.1,
+      "cpu": 29.1,
+      "queue": 70,
+      "done": 351,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 422
+    },
+    {
+      "t": 221,
+      "rss_mb": 50.2,
+      "cpu": 24.5,
+      "queue": 74,
+      "done": 367,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 442
+    },
+    {
+      "t": 231,
+      "rss_mb": 52.4,
+      "cpu": 27.1,
+      "queue": 77,
+      "done": 384,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 462
+    },
+    {
+      "t": 241,
+      "rss_mb": 54.7,
+      "cpu": 28.2,
+      "queue": 82,
+      "done": 400,
+      "failed": 0,
+      "p95_ms": 567,
+      "sent": 483
+    }
+  ]
+}

@@ -102,6 +102,8 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 - 崩溃恢复：启动时 `recover_interrupted()` 把残留 `running` 标成 `interrupted`，并在连上 QQ 后主动通知。
 - 并发：`workers` 配置默认 1；多个 worker 时按 `cwd` 加 `asyncio.Lock`，同目录串行；**多 worker 会禁用 `--resume`**，避免共享同一会话。
 - 背压：`STORE.queue_depth() >= max_queue` 直接拒绝，不无限堆积。
+- 后端选择：`store_backend: "sqlite" | "redis"`；Redis 支持直连（`redis_url`）或哨兵（`redis_sentinel: ["127.0.0.1:26380", ...]` + `redis_master_name`）。
+- agent 沙箱：`agent_sandbox: "none" | "wsl"`，配 `agent_sandbox_cmd`（WSL 内的 CLI 路径）；启动时会探测命令是否存在。
 - 成本：每任务记录 `tokens_in/tokens_out`（含缓存命中）；单次输入超过 `session_token_limit`（默认 120k）自动清空 `session_id`，重启时也会丢弃超限旧会话。`cost_usd` 是 CLI 按 Claude 价目估的，不等于 DeepSeek 实际账单。
 
 ## 开发约定

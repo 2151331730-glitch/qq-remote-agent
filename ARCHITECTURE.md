@@ -115,6 +115,21 @@ Docker Desktop 常驻约 5 GB 内存，默认**不随开机启动**，需要用�
 **做法**：启动时 bind `127.0.0.1:30991` 当进程锁，绑定失败直接退出。
 **代价**：同机不能跑两个实例；要模拟多机，用 Redis 后端 + 不同工作目录即可。
 
+### ADR-014 agent 任务也可以进 WSL 沙箱
+**背景**：`!!` 只隔离 shell 命令，agent 任务仍在本体全权限跑，这是之前明确写下的缺口。
+**做法**：`agent_sandbox: "wsl"` + `agent_sandbox_cmd`（WSL 里的 CLI 路径）。桥把提示词写临时文件、
+用 `wsl -e bash -lc` 调起，工作目录映射到 `/mnt/c/...`；启动时探测命令是否存在，找不到就打日志说明。
+**验证**：WSL 里放一个假 CLI，端到端跑通（`tests/test_agent_sandbox.py`，无 WSL 自动跳过）。
+**边界**：前提是 WSL 里装了 Claude Code（Linux 版）。本机 WSL 只有 Windows 的 node，所以默认仍为 `none`；
+**能力是通的，真机使用需要先装 Linux 版 CLI**。
+
+### ADR-015 Redis 用哨兵而不是 Cluster
+**背景**：单主 Redis 挂了队列就停。
+**做法**：主从 + 三哨兵，客户端自己问哨兵要主库地址（不用 redis-py 的 Sentinel，因为它不接受 `protocol=2`，
+会对 Redis 5 发 `HELLO 3`）；断连或 `READONLY` 时重新发现主库并重试一次。
+**实测**：4.6 秒选出新主，5.6 秒恢复写入，数据完整。
+**取舍**：Cluster 支持分片但运维复杂；本方数据量小，哨兵足够，且明确知道"异步复制可能丢最后几条写"。
+
 ## 5. 已知限制
 
 - 单机单实例；`state.json` 与 SQLite 都是本地文件。

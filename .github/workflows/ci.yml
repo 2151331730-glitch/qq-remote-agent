@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    name: 单元测试 (${{ matrix.python-version }})
     runs-on: windows-latest
     strategy:
       matrix:
@@ -25,4 +26,24 @@ jobs:
       - name: 语法检查
         env:
           PYTHONUTF8: "1"
-        run: python -m py_compile bridge/bridge.py bridge/store.py bridge/metrics.py bridge/panel.py bridge/guard.py
+        run: python -m py_compile bridge/bridge.py bridge/store.py bridge/store_redis.py bridge/metrics.py bridge/panel.py bridge/guard.py bridge/sandbox.py
+
+  e2e:
+    name: 端到端（假 OneBot + 真桥 + 假 CLI）
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: pip install websockets
+      - name: 队列 / 幂等 / 命令（mock_test5）
+        env:
+          PYTHONUTF8: "1"
+        run: python tests/mock_test5.py
+      - name: 危险操作确认 / 看板（mock_test6）
+        env:
+          PYTHONUTF8: "1"
+        run: python tests/mock_test6.py
