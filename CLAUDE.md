@@ -123,6 +123,9 @@ bridge 是**常驻进程**，改完 `bridge.py` 不重启 = 改动无效，这�
 - 限流：`public_max_per_hour`（全局每小时）、`public_cooldown_seconds`（单会话冷却）、
   `public_max_pending`（同时排队数）、`public_max_input_chars`（输入截断）、
   `public_max_reply_chars`（回复截断）。总开关 `public_chat`。
+- 群接话策略：`group_policy` = `"mention"`（默认，只 @）/ `"open"`（全回）/ `0~1`（没 @ 时按概率插话，
+  当前生产为 `0.1`）；`group_policy_overrides` 按群覆盖；`group_min_chars`（默认 4）以下的消息不插话。
+  纯函数在 `bridge/policy.py`，改判定逻辑先动这里和 `tests/test_policy.py`。
 - 公开回复不走发件箱（陌生人消息丢了就丢了，不值得入库），失败只记日志。
 - **自动读上下文**：回复前先从本地 `bridge/transcripts/<scope>.jsonl` 读最近 12 条
   （`history.tail`），有记录就不问 NapCat；没有才回退 `get_group_msg_history` / `get_friend_msg_history`。

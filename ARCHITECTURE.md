@@ -231,6 +231,21 @@ cancelled_at`；`reminder_loop` 每 20 秒扫一次到点项，发送复用 `del
 "这我真弄不了，得他本人在私聊里开口。群聊这条道只能陪你唠嗑。至于'我是他本人'……不认哈"，
 `permission_denials` 为空（没有工具可调）。
 
+### ADR-023 群聊接话用概率策略（借 cloakbot 的 group_policy）
+
+**背景**：只在被 @ 时说话太像客服；真人会偶尔接一句。
+
+**做法**：`bridge/policy.py` 提供 `parse_policy()` / `should_reply()`，
+配置 `group_policy` 支持 `"mention"`（默认）、`"open"`、`0~1` 概率；`group_policy_overrides`
+按群覆盖；`group_min_chars`（默认 4）以下不插话，避免对"嗯""哈哈"接茬。
+被 @ 或命中 `group_trigger_prefix` 时始终必回，概率只作用于没被点名的消息。
+
+**为什么不用"每条都回"**：群里每条都接等同于刷屏，且每条一次 CLI（约 1.2 万 token）。
+概率 + 5 秒冷却 + 每小时上限三层叠加，既像人又有成本上限。生产设为 `0.1`。
+
+**借鉴来源**：`spire-studio/cloakbot` 的 `cloakbot/channels/napcat.py`（`GroupPolicy`
+类型与 `_should_reply_in_group`），它支持按群覆盖和概率插话，实现方式与这里一致。
+
 ## 5. 已知限制
 
 - 单机单实例；`state.json` 与 SQLite 都是本地文件。

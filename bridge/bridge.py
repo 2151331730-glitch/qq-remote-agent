@@ -34,6 +34,7 @@ import sandbox
 import memory
 import context as context_mod
 import history
+import policy
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
 from metrics import METRICS
@@ -108,6 +109,15 @@ PUBLIC_MAX_PENDING = int(CFG.get("public_max_pending", 3))
 PUBLIC_WORKDIR = Path(CFG.get("public_workdir") or (BASE / "tmp" / "public"))
 # 群里只有 @ 机器人（或说这个前缀）才会回，避免刷屏
 GROUP_PREFIX = str(CFG.get("group_trigger_prefix") or "")
+# 接话策略：mention（只 @）/ open（全回）/ 0~1（没 @ 时按概率插一句，像真人）
+GROUP_POLICY = CFG.get("group_policy", "mention")
+GROUP_POLICY_OVERRIDES = dict(CFG.get("group_policy_overrides") or {})
+GROUP_MIN_CHARS = int(CFG.get("group_min_chars", 4))
+
+
+def group_policy_for(gid: int):
+    raw = GROUP_POLICY_OVERRIDES.get(str(gid), GROUP_POLICY)
+    return policy.parse_policy(raw)
 # 公开聊天的人格/规则：优先读文件（可随时改，不必重启），再 config，最后用内置兜底
 PUBLIC_PERSONA_PATH = Path(CFG.get("public_persona_path") or (BASE / "public_persona.md"))
 PUBLIC_SYSTEM = str(CFG.get("public_system_prompt") or """你是一个 QQ 聊天机器人，正在和不是主人的网友聊天（可能是私聊，也可能是群聊）。
@@ -1050,16 +1060,25 @@ async def on_group_message(data, self_id: int):
     # 群里的闲聊也落盘：被 @ 的时候这些就是"前情"（只写本地，不花 token）
     if text:
         _record(f"group:{gid}", uid, name, text)
-    if not at_me:
-        if not GROUP_PREFIX or not text.startswith(GROUP_PREFIX):
+
+    addressed = at_me
+    if not addressed and GROUP_PREFIX and text.startswith(GROUP_PREFIX):
+        addressed = True
+        text = text[len(GROUP_PREFIX):].strip()
+    policy_value = group_policy_for(gid)
+    if not addressed:
+        # 概率插话：像真人那样偶尔接一句；太短的消息（"嗯""哈哈"）不凑热闹
+        if len(text) < GROUP_MIN_CHARS or not policy.should_reply(policy_value, False):
             METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
             return
-        text = text[len(GROUP_PREFIX):].strip()
-    # 无论后面怎么处理，先留一行证据：排查"群消息到底有没有到桥"只看这句
-    METRICS.inc("qq_remote_group_messages_total", {"addressed": "yes"})
-    log(f"群消息 [group:{gid}] uid={uid} at={at_me} 文本={text[:60] or '（空）'}")
+        METRICS.inc("qq_remote_group_messages_total", {"addressed": "random"})
+        log(f"群消息 [group:{gid}] uid={uid} 概率插话（policy={policy_value}）：{text[:60]}")
+    else:
+        # 无论后面怎么处理，先留一行证据：排查"群消息到底有没有到桥"只看这句
+        METRICS.inc("qq_remote_group_messages_total", {"addressed": "yes"})
+        log(f"群消息 [group:{gid}] uid={uid} at={at_me} 文本={text[:60] or '（空）'}")
     if not text:
-        if at_me:
+        if addressed:
             await _group_hello(gid, uid)
         return
     # 群聊一律只陪聊：即使是主人，也不在群里执行任务（结果会公开可见）

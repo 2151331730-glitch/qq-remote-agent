@@ -493,3 +493,30 @@
   `permission_denials` 为空，输入 12,835 token。
 - `pytest` → 121 passed, 12 skipped（新增公开人格文件读取/兜底 2 项）。
 - 端到端：只 @ 的回复已改为短句，断言通过。
+
+## 2026-10-25 00:45 概率插话 + 去 AI 味（参考 GitHub 项目）
+
+### 借鉴来源
+
+- `spire-studio/cloakbot`（205★）`cloakbot/channels/napcat.py`：
+  `GroupPolicy = "mention" | "open" | 0~1 概率`、`group_policy_overrides` 按群覆盖、
+  `_should_reply_in_group()` 的判定顺序（被 @ 必回 → open → 概率）。
+- `brandonwise/humanizer`（MIT）：28 种"AI 味"模式里的聊天痕迹部分
+  （客套开场、复述问题、三点排比、结尾总结、emoji/破折号滥用、客服腔）。
+
+### 做了什么
+
+1. 新模块 `bridge/policy.py`：`parse_policy()`（mention/open/0~1，越界钳制、非法回退）
+   与 `should_reply()`（被点名必回，概率只作用于没被点名）。
+2. `on_group_message`：新增 `group_policy` / `group_policy_overrides` / `group_min_chars`（默认 4）。
+   没 @ 时按概率插话；太短（"嗯""哈哈"）不凑热闹；日志区分「概率插话」。
+3. `public_persona.md` 增加「别像个 AI」一节：不说客套开场、不复述问题、不三点排比、不结尾总结、
+   少破折号/加粗/emoji、拒绝别用"作为 AI/我无法"。
+4. 生产 `group_policy` 设为 `0.1`；示例配置保持 `"mention"`（保守默认）。
+
+### 验证
+
+- `pytest` → 127 passed, 12 skipped（新增 `test_policy.py` 6 项）。
+- 端到端：设置 `group_policy: 1.0` 后，群里没 @ 的「随便说说」会接话（stub 回复），
+  「嗯」因为太短不接；总群回复数 3 条，断言通过。
+- 成本：每次概率插话约 1.2 万输入 token；0.1 + 5 秒冷却 + 每小时 20 条上限共同兜底。

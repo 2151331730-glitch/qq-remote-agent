@@ -57,7 +57,8 @@ cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
             "persona_path": str(ROOT / "bridge" / "persona.md"),
             "memory_path": str(TMP / "chat-memory.md"),
             "public_chat": True, "public_cooldown_seconds": 1,
-            "public_max_per_hour": 50, "transcript_dir": str(TRANSCRIPTS)})
+            "public_max_per_hour": 50, "transcript_dir": str(TRANSCRIPTS),
+            "group_policy": 1.0})
 CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 for p in (STATE, DB, REMINDERS, TMP / "chat-memory.md"):
     if p.exists():
@@ -172,7 +173,9 @@ async def handler(ws):
         await asyncio.sleep(2.5)
         await send(ev_group("", at=True), "群里只 @、不说话")
         await asyncio.sleep(2.5)
-        await send(ev_group("随便说说", at=False), "群里没 @：随便说说")
+        await send(ev_group("随便说说", at=False), "群里没 @：随便说说（概率插话）")
+        await asyncio.sleep(2.5)
+        await send(ev_group("嗯", at=False), "群里没 @：太短，不凑热闹")
         await asyncio.sleep(2.5)
         await send(ev("!dir C:\\", uid=STRANGER), "陌生人发 !dir（必须只陪聊）")
         await asyncio.sleep(2)
@@ -198,7 +201,7 @@ async def main():
         bridge = subprocess.Popen([sys.executable, str(ROOT / "bridge" / "bridge.py")],
                                   cwd=str(ROOT / "bridge"), env=env,
                                   stdout=bridge_log, stderr=subprocess.STDOUT)
-        await asyncio.sleep(48)
+        await asyncio.sleep(52)
         bridge.terminate()
         try:
             bridge.wait(timeout=10)
@@ -264,11 +267,12 @@ check(not any("人格设定" in msg or "测试记忆" in msg for _, msg in PUBLI
 check(not any("Directory" in msg or "Volume" in msg for _, msg in PUBLIC_REPLIES),
       "陌生人发 !dir 不能真的执行命令")
 
-# 群聊：@ 才回；只 @ 不说话也要有回音（否则看起来像没上线）
-check(len(GROUP_REPLIES) == 2, f"群聊应回复「@+文字」和「只 @」两条，实际 {GROUP_REPLIES}")
-check(any(msg.startswith("stub-ok") for _, msg in GROUP_REPLIES), "带文字的 @ 应走公开闲聊")
-check(any("直接说" in msg or msg.strip() in ("在呢", "嗯？咋了", "在的，说呗", "咋了")
-          for _, msg in GROUP_REPLIES), "只 @ 不说话应回一句自然的短话")
+# 群聊：@ 必回；概率策略下没 @ 也会接一句；太短的不理
+check(len(GROUP_REPLIES) == 3, f"群聊应回「@+文字」「只 @」「概率插话」三条，实际 {GROUP_REPLIES}")
+check(sum(1 for _, msg in GROUP_REPLIES if msg.strip() in ("在呢", "嗯？咋了", "在的，说呗", "咋了")) == 1,
+      "只 @ 不说话应回一句自然的短话")
+check(sum(1 for _, msg in GROUP_REPLIES if msg.startswith("stub-ok")) == 2,
+      "被 @ 和概率插话都应走公开闲聊")
 check(all(gid == GROUP for gid, _ in GROUP_REPLIES), "群回复应发回原群")
 check(not any("人格设定" in msg for _, msg in GROUP_REPLIES), "群回复不能带主人的人格")
 # 上下文：回复前会拉历史，摘录应出现在提示词里（stub 回显前 40 字）
