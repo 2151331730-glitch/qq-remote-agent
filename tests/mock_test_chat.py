@@ -152,6 +152,8 @@ async def handler(ws):
         await asyncio.sleep(2.5)
         await send(ev_group("讲个笑话"), "群里 @ 机器人：讲个笑话")
         await asyncio.sleep(2.5)
+        await send(ev_group("", at=True), "群里只 @、不说话")
+        await asyncio.sleep(2.5)
         await send(ev_group("随便说说", at=False), "群里没 @：随便说说")
         await asyncio.sleep(2.5)
         await send(ev("!dir C:\\", uid=STRANGER), "陌生人发 !dir（必须只陪聊）")
@@ -178,7 +180,7 @@ async def main():
         bridge = subprocess.Popen([sys.executable, str(ROOT / "bridge" / "bridge.py")],
                                   cwd=str(ROOT / "bridge"), env=env,
                                   stdout=bridge_log, stderr=subprocess.STDOUT)
-        await asyncio.sleep(43)
+        await asyncio.sleep(48)
         bridge.terminate()
         try:
             bridge.wait(timeout=10)
@@ -244,10 +246,11 @@ check(not any("人格设定" in msg or "测试记忆" in msg for _, msg in PUBLI
 check(not any("Directory" in msg or "Volume" in msg for _, msg in PUBLIC_REPLIES),
       "陌生人发 !dir 不能真的执行命令")
 
-# 群聊：只有 @ 才回，且走公开通道
-check(len(GROUP_REPLIES) == 1, f"群聊只应回复 @ 的那条，实际 {GROUP_REPLIES}")
-check(GROUP_REPLIES[0][0] == GROUP and GROUP_REPLIES[0][1].startswith("stub-ok"),
-      "群回复应发回原群且走公开闲聊")
+# 群聊：@ 才回；只 @ 不说话也要有回音（否则看起来像没上线）
+check(len(GROUP_REPLIES) == 2, f"群聊应回复「@+文字」和「只 @」两条，实际 {GROUP_REPLIES}")
+check(any(msg.startswith("stub-ok") for _, msg in GROUP_REPLIES), "带文字的 @ 应走公开闲聊")
+check(any("直接说" in msg for _, msg in GROUP_REPLIES), "只 @ 不说话应回一句提示")
+check(all(gid == GROUP for gid, _ in GROUP_REPLIES), "群回复应发回原群")
 check(not any("人格设定" in msg for _, msg in GROUP_REPLIES), "群回复不能带主人的人格")
 
 # 好友申请：陌生人不动，主人同意

@@ -919,8 +919,24 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
 async def on_public_private(data, uid: int, text: str):
     text = re.sub(r"\[CQ:[^\]]+\]", "", text or "").strip()
     if not text:
+        log(f"陌生人私聊（没有文字，忽略）：{uid}")
         return
+    log(f"陌生人私聊：{uid}：{text[:80]}")
     await handle_public(f"user:{uid}", "private", uid, text, who=str(uid))
+
+
+async def _group_hello(gid: int, uid: int):
+    """只 @ 不说话时给个回音：否则对方看到的是"上线了但不理人"。"""
+    scope = f"group:{gid}"
+    allowed, why = public_gate(scope)
+    if not allowed:
+        log(f"群消息只有 @，但被限流（{why}）：{scope}")
+        return
+    now = time.time()
+    PUBLIC_STATE["stamps"].append(now)
+    PUBLIC_STATE["last"][scope] = now
+    log(f"群消息只有 @，回提示：{scope} {uid}")
+    await send_to("group", gid, "在，有事直接说。（要操作电脑请主人私聊我。）")
 
 
 async def on_group_message(data, self_id: int):
@@ -933,9 +949,15 @@ async def on_group_message(data, self_id: int):
     text, at_me = _group_text(data, self_id)
     if not at_me:
         if not GROUP_PREFIX or not text.startswith(GROUP_PREFIX):
+            METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
             return
         text = text[len(GROUP_PREFIX):].strip()
+    # 无论后面怎么处理，先留一行证据：排查"群消息到底有没有到桥"只看这句
+    METRICS.inc("qq_remote_group_messages_total", {"addressed": "yes"})
+    log(f"群消息 [group:{gid}] uid={uid} at={at_me} 文本={text[:60] or '（空）'}")
     if not text:
+        if at_me:
+            await _group_hello(gid, uid)
         return
     sender = data.get("sender") or {}
     name = sender.get("card") or sender.get("nickname") or str(uid)
