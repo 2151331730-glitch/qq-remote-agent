@@ -33,7 +33,6 @@ from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from metrics import METRICS
 from panel import Panel
 from store import TaskStore
-from store_redis import RedisStore
 
 BASE = Path(__file__).resolve().parent
 # 测试时用环境变量指向临时文件，避免抢占真机正在跑的那一套
@@ -87,6 +86,8 @@ LAST_RESULT = ""
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
 STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
 if STORE_BACKEND == "redis":
+    # 按需导入：用 SQLite 的环境不需要装 redis 包（CI 里也没装）
+    from store_redis import RedisStore
     STORE = RedisStore(os.environ.get("QQ_REMOTE_REDIS")
                        or CFG.get("redis_url") or "redis://127.0.0.1:6380/0")
 else:
