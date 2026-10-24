@@ -28,10 +28,12 @@ from pathlib import Path
 
 from websockets.asyncio.client import connect
 
+import sandbox
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from metrics import METRICS
 from panel import Panel
 from store import TaskStore
+from store_redis import RedisStore
 
 BASE = Path(__file__).resolve().parent
 # 测试时用环境变量指向临时文件，避免抢占真机正在跑的那一套
@@ -75,7 +77,13 @@ STATE = {"owner_uin": int(CFG.get("owner_uin", 0) or 0), "session_id": "", "cwd"
          "current_task": "", "last_tokens_in": 0}
 COST_TOTAL = 0.0
 LAST_RESULT = ""
-STORE = TaskStore(DB_PATH)
+# 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
+STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
+if STORE_BACKEND == "redis":
+    STORE = RedisStore(os.environ.get("QQ_REMOTE_REDIS")
+                       or CFG.get("redis_url") or "redis://127.0.0.1:6380/0")
+else:
+    STORE = TaskStore(DB_PATH)
 WAKE = asyncio.Event()
 # task_id -> {"task": asyncio.Task, "proc": Process, "text": str, "started": float, "cwd": str}
 RUNNING: dict[str, dict] = {}
@@ -226,8 +234,10 @@ async def run_claude(prompt: str, task_id: str, cwd: str) -> tuple[bool, str, fl
     use_session = WORKERS == 1
 
     async def _once(use_resume: bool):
-        args = [CLAUDE, "-p", prompt, "--output-format", "json",
-                "--dangerously-skip-permissions"]
+        # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
+        base = list(CFG.get("claude_cmd") or [CLAUDE])
+        args = base + ["-p", prompt, "--output-format", "json",
+                       "--dangerously-skip-permissions"]
         if use_resume and use_session and STATE.get("session_id"):
             args += ["--resume", STATE["session_id"]]
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
@@ -317,8 +327,13 @@ async def _cwd_lock(cwd: str) -> asyncio.Lock:
 async def worker(wid: int):
     """worker pool 里的一个执行单元。"""
     while True:
-        row = STORE.claim_next()
+        busy = [c for c, lk in LOCKS.items() if lk.locked()]
+        row = STORE.claim_next(exclude_cwds=busy)
         if row is None:
+            if STORE.queue_depth() and busy:
+                # 队列里还有活，但都在忙目录上：等一会儿再抢，别空转
+                await asyncio.sleep(0.05)
+                continue
             WAKE.clear()
             try:
                 await asyncio.wait_for(WAKE.wait(), timeout=30)
@@ -330,12 +345,6 @@ async def worker(wid: int):
         tid = row["id"]
         cwd = row.get("cwd") or STATE.get("cwd") or WORKDIR
         lock = await _cwd_lock(cwd)
-        if lock.locked():
-            # 同一目录已有任务在跑：放回队列，等别的 cwd 先跑
-            STORE.requeue(tid)
-            await asyncio.sleep(1)
-            continue
-
         async with lock:
             await _execute(row, cwd)
 
@@ -427,6 +436,7 @@ HELP = """命令：
 /cd <路径> 换工作目录
 /心跳 测试是否在线
 !<命令> 直接执行 PowerShell（例：!dir C:\\）
+!!<命令> 在沙箱里执行（WSL/Docker，隔离但只挂载当前目录）
 其他任何文字 = 交给 claude 干活
 （危险任务会先要求 /确认；本机看板 http://127.0.0.1:3099/）"""
 
@@ -604,8 +614,8 @@ async def _ask_confirm(kind, text, source, reason):
     return {"status": "confirm", "reason": reason}
 
 
-async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender=None):
-    """入队一个 agent 任务；危险任务先要求确认。"""
+async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender=None, cwd=None):
+    """入队一个 agent 任务；危险任务先要求确认。cwd 指定后可按目录并行。"""
     text = (text or "").strip()
     if not text:
         return {"status": "rejected", "error": "empty"}
@@ -615,7 +625,7 @@ async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender
     if reason and not confirmed:
         return await _ask_confirm("task", text, source, reason)
     tid, dup = STORE.enqueue(text, source=source, sender=sender, dedup_key=dedup_key,
-                             cwd=STATE.get("cwd") or WORKDIR)
+                             cwd=cwd or STATE.get("cwd") or WORKDIR)
     if dup:
         log(f"重复投递，忽略：{dedup_key} -> {tid}")
         return {"status": "duplicate", "id": tid}
@@ -625,7 +635,10 @@ async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender
 
 
 async def submit_shell(text, source="qq", confirmed=False):
-    cmd = text[1:].strip() if text.startswith("!") else text.strip()
+    if text.startswith("!!"):
+        cmd = text[2:].strip()
+    else:
+        cmd = text[1:].strip() if text.startswith("!") else text.strip()
     if not cmd:
         await send("用法：!<PowerShell 命令>")
         return {"status": "rejected", "error": "empty"}
@@ -649,21 +662,24 @@ async def _run_confirmed(entry):
 
 
 async def handle_shell(text: str):
-    cmd = text[1:].strip()
+    # "!!" = 走沙箱后端（WSL/Docker），"!" = 原生 PowerShell
+    sandboxed = text.startswith("!!")
+    cmd = (text[2:] if sandboxed else text[1:]).strip()
     if not cmd:
-        await send("用法：!<PowerShell 命令>")
+        await send("用法：!<PowerShell 命令> 或 !!<沙箱命令>")
         return
+    backend = sandbox.pick_backend(CFG.get("sandbox_backend", "auto")) if sandboxed else "powershell"
     tid = uuid.uuid4().hex[:8]
     t0 = time.time()
-    audit(AUDIT_PATH, event="shell_start", id=tid, cmd=cmd[:500])
-    log(f"直接命令：{cmd}")
+    audit(AUDIT_PATH, event="shell_start", id=tid, cmd=cmd[:500], backend=backend)
+    log(f"直接命令（{backend}）：{cmd}")
     try:
-        # 显式把 PowerShell 的输出编码设成 UTF-8，否则中文输出会按 GBK 出来变乱码
-        wrapped = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-                   "$OutputEncoding=[System.Text.Encoding]::UTF8; " + cmd)
+        argv = sandbox.build_command(cmd, STATE.get("cwd") or WORKDIR, backend)
+        # WSL_UTF8=1：否则 wsl.exe 的提示信息按 GBK 输出，中文会变乱码
+        env = dict(os.environ, WSL_UTF8="1", PYTHONUTF8="1")
         proc = await asyncio.create_subprocess_exec(
-            "powershell", "-NoProfile", "-Command", wrapped,
-            cwd=STATE.get("cwd") or WORKDIR,
+            *argv,
+            cwd=STATE.get("cwd") or WORKDIR, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=180)

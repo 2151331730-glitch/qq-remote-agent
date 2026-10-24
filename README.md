@@ -27,6 +27,9 @@
 | 一条命令把电脑搞崩 | 危险词/危险命令识别 → 先在 QQ 里要 `/确认`，5 分钟有效 |
 | 改了代码没生效 | 进程启动时间 vs 文件修改时间的自动校验（`restart-bridge.ps1`） |
 | `--resume` 越聊越贵（实测单次到 205k token） | 记录真实 token；超过 `session_token_limit` 自动开新会话，启动时也会丢弃超限的旧会话 |
+| 想横向扩、多台机器一起消费 | `store_backend=redis`：两个进程共享队列，Lua 原子 claim，实测 40 条任务 20/20 分摊、零重复 |
+| 一条命令把整台机器搞坏 | `!!` 前缀走沙箱后端（Docker/WSL），只挂载当前目录；边界写在 `ARCHITECTURE.md` |
+| 不知道能扛多少 | `docs/benchmarks.md`：4 worker 跨目录 3.6 倍吞吐，同目录刻意不加速 |
 
 ## 快速开始
 

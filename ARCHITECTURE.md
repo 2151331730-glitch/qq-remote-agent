@@ -79,6 +79,24 @@ claude 在同一目录并发会互相踩文件；不同目录没有冲突。
 ### ADR-007 自实现指标，不引 prometheus_client
 只有 4 个指标，标准库足够；但严格按 Prometheus 命名约定（`_total`、`_seconds`、histogram 累积桶），换成官方库时采集端不用改。
 
+### ADR-008 队列支持 Redis 后端（多进程/多机）
+**背景**：SQLite 是本地文件，跨进程可以、跨机器不行。
+**做法**：`store_redis.py` 实现同一套 6 个方法；任务 JSON 存 HASH，队列用 ZSET（score = -priority*1e12 + created_at），
+claim 用 Lua 脚本把"检查状态 + 改状态 + 出队"做成原子操作。
+**验证**：两个 bridge 进程共享同一 Redis，40 条任务 20/20 分摊、无重复（`tests/demo_multiworker.py`）。
+**取舍**：Redis 是单点；真要多副本得上哨兵/集群，本项目只做到"多 worker 共享队列"。
+**为什么不用 Redis 做默认**：单机场景多一个常驻进程不值，SQLite 够用且零运维。
+
+### ADR-009 沙箱边界：只隔离 `!` 命令，且只缩小破坏半径
+**背景**：agent 任务跑 `claude.exe`（Windows 二进制，要读本机配置），没法整体塞进容器。
+**做法**：`!!` 前缀的 shell 命令走沙箱后端：Docker（`--network none --rm`，只挂载 cwd）或 WSL（Ubuntu，看不到注册表/服务）。
+**诚实结论**：这不叫安全沙箱。agent 任务仍然是全权限；沙箱只把"命令级破坏"从整机缩小到一个目录。
+**没做的**：Windows AppContainer / 受限令牌；真要强隔离得把 agent 也容器化。
+
+### ADR-010 压测用假 CLI
+真实任务一次 8–60 秒且要花钱，测不出调度开销。`tests/stub_claude.py` 输出与真 CLI 同构的 JSON，
+固定 200ms 延迟，于是压测测的是**队列与调度**，不是模型。数字与结论见 `docs/benchmarks.md`。
+
 ## 5. 已知限制
 
 - 单机单实例；`state.json` 与 SQLite 都是本地文件。

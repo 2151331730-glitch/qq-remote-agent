@@ -166,7 +166,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not text:
             return self._send(400, '{"error":"empty"}')
         try:
-            res = p.submit_sync(text)
+            res = p.submit_sync(text, body.get("cwd"))
         except Exception as e:
             return self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
         self._send(200, json.dumps(res, ensure_ascii=False))
@@ -196,6 +196,6 @@ class Panel:
         self.url = f"http://127.0.0.1:{self.port}/"
         return self.url
 
-    def submit_sync(self, text):
-        fut = asyncio.run_coroutine_threadsafe(self.submit_coro(text, "web"), self.loop)
+    def submit_sync(self, text, cwd=None):
+        fut = asyncio.run_coroutine_threadsafe(self.submit_coro(text, "web", cwd=cwd), self.loop)
         return fut.result(timeout=15)

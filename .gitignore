@@ -22,3 +22,8 @@ downloads/
 
 # 本机配置文件里有 token，入库只放 example
 bridge/config.json
+
+# 压测/监控下载的大件
+tools/redis/
+tools/monitor/
+docs/bench/*.json

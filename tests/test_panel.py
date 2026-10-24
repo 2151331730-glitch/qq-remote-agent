@@ -44,8 +44,8 @@ def panel():
     th = threading.Thread(target=loop.run_forever, daemon=True)
     th.start()
 
-    async def submit(text, source="web"):
-        return {"status": "queued", "id": "abc123", "pos": 1, "echo": text}
+    async def submit(text, source="web", cwd=None):
+        return {"status": "queued", "id": "abc123", "pos": 1, "echo": text, "cwd": cwd}
 
     p = Panel(_free_port(), "secret-token", loop,
               state_fn=lambda: {"current": "", "queue": 2, "done": 5},
