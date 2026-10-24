@@ -175,3 +175,27 @@
 - 端点 `/api/tasks` 语义从"审计事件"改成"任务列表"，旧测试要改用 `/api/events`
 - `!` 命令的 PowerShell 输出偶发 GBK 乱码 → 命令前置 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`
 - claude.exe 自更新时偶发 WinError 216 → 起进程失败重试一次
+
+### 2026-10-24 18:14-18:36 四件套：压测 / Redis / 沙箱 / Grafana
+
+**1. 压测（docs/benchmarks.md）**
+- 假 CLI（tests/stub_claude.py）+ 可替换命令（config.claude_cmd），压测零 token 成本
+- 40 任务：1 worker 同目录 2.83/s；4 worker 同目录 2.88/s（锁生效，故意不加速）；
+  4 worker 跨目录 **10.15/s（3.6 倍）**
+- 优化：claim 时直接跳过已锁目录（`claim_next(exclude_cwds=...)`），跨目录吞吐 5.16 → 10.15
+
+**2. Redis 后端（store_redis.py）**
+- 同 6 个方法：HASH 存任务、ZSET 做队列、SET 记 running、Lua 原子 claim
+- 演示（tests/demo_multiworker.py）：两个 bridge 进程共享队列，40 条 20/20 分摊，4.94s，8.09/s，零重复
+- 坑：redis-py 8 默认 RESP3（HELLO 3），Redis 5.0 不认 → `protocol=2`
+
+**3. 沙箱（sandbox.py）**
+- `!!` 前缀命令走沙箱：Docker（--network none --rm，只挂 cwd）→ WSL（Ubuntu）→ PowerShell 兜底
+- 实测 WSL 后端：`!!` 命令在 Linux 里跑，`/mnt/c` 可见
+- 诚实边界写进 ADR-009：agent 任务仍是全权限，沙箱只缩小"命令级破坏半径"
+
+**4. Grafana**
+- winget 找不到包 → 直连 dl.grafana.com（Pigeon 代理，473MB）+ GitHub 下 Prometheus（108MB）
+- Grafana 13 首启要从 catalog 装 datasource 插件，不挂代理会失败（Plugin not registered）
+  → 用 HTTP(S)_PROXY 起进程后正常
+- provisioning 自动装配数据源与 8 面板仪表盘；截图存 docs/grafana-dashboard.png
