@@ -38,6 +38,7 @@ import history
 import policy
 import chatstyle
 import humantype
+import modelprofiles
 import voice as voice_mod
 import stickers as sticker_mod
 from direct import DirectChat
@@ -95,7 +96,12 @@ STREAM_PROGRESS = bool(CFG.get("stream_progress", True))
 STREAM_TEXT = bool(CFG.get("stream_text", True))
 STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
 STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
+# 任务模型：固定取配置值，不随 /model 变化
 MODEL = CFG.get("model") or ""
+# 闲聊走哪个端点：default（DeepSeek 直连）/ bee（beeapi.ai 中转）。
+# 只由 /model 切换闲聊，见下方「闲聊模型档案」一节；任务侧不看这两个值。
+CHAT_PROVIDER = "default"
+CHAT_PROFILE = "flash"
 # ---- 任务通道瘦身（照 wangpx2006/qq-agent-plugins 的实测数据抄的）----
 # 上游：https://github.com/wangpx2006/qq-agent-plugins（MIT）
 # claude.exe 的固定开销按层拆开实测：默认全量 53,948 → 禁 MCP 27,695 → 再限制内置工具 12,986。
@@ -163,6 +169,107 @@ DIRECT = DirectChat(CFG.get("chat_direct") or {})
 OWNER_DIRECT = bool((CFG.get("chat_direct") or {}).get("owner", True))
 # 公开通道也走直连（群聊/陌生人本来就只陪聊，不需要工具）
 PUBLIC_DIRECT = bool((CFG.get("chat_direct") or {}).get("public", True))
+
+# ---------------- 闲聊模型档案：只换闲聊，任务恒走 DeepSeek ----------------
+# 定死的边界（2026-10-25 主人拍板）：
+#   任务链路（claude.exe）**永远**走配置里的默认 DeepSeek：不加 --settings、
+#   不过代理、不看档案。任务要的是稳和便宜，不跟着闲聊换。
+#   闲聊链路（直连 /v1/messages）可在 DeepSeek 与 bee 的 Grok 4.7 之间切：
+#     /model grok  → bee 端点 + grok-4.7，走本地代理 127.0.0.1:7892
+#     /model flash → 回配置里的 DeepSeek Flash（直连，不过代理）
+# 为什么拆开：实测同一句话 DeepSeek 1.0s / 77 in，grok-4.7 3.3s / 344 in。
+# 换来的是另一种说话风格；单聊会明显慢，别让它顺手把任务也拖慢。
+# 纯函数（读 bee 配置、探端口、存状态）都在 modelprofiles.py，那边有单测。
+BEE_SETTINGS_PATH = Path(CFG.get("bee_settings_path")
+                         or (Path.home() / ".claude" / "settings-bee.json"))
+BEE_PROXY = str(CFG.get("bee_proxy") or modelprofiles.BEE_PROXY)
+BEE_AUTOSTART_PROXY = bool(CFG.get("bee_autostart_proxy", True))
+# 切换结果落盘：重启 bridge 不会被悄悄改回默认（文件里只有档案名，没有 key）
+MODEL_STATE_PATH = Path(os.environ.get("QQ_REMOTE_MODEL_STATE")
+                        or (BASE / "model_state.json"))
+MODEL_PROFILES = modelprofiles.MODEL_PROFILES
+
+
+def _ensure_proxy(autostart: bool = True) -> bool:
+    ok = modelprofiles.ensure_proxy(BEE_PROXY, autostart and BEE_AUTOSTART_PROXY)
+    if ok:
+        logger.info("本地代理已就绪（Pigeon）")
+    return ok
+
+
+def _save_chat_state():
+    if not modelprofiles.save_state(MODEL_STATE_PATH, CHAT_PROFILE, DIRECT.model, CHAT_PROVIDER):
+        logger.warning("闲聊模型状态没写下来：%s", MODEL_STATE_PATH)
+
+
+def _chat_defaults() -> tuple[str, str, str]:
+    """配置里的默认闲聊端点（DeepSeek）。返回 (model, base_url, api_key)。"""
+    chat = CFG.get("chat_direct") or {}
+    model = str(chat.get("model") or "deepseek-v4-flash")
+    key, base = chat.get("api_key") or "", (chat.get("base_url") or "").rstrip("/")
+    if not (key and base):                      # 配置里没写就走自动探测（DeepSeek 优先）
+        from direct import _find_key_from_settings
+        key, base = _find_key_from_settings()
+    return model, base, key
+
+
+def _set_default_chat():
+    """把闲聊接回配置里的默认端点和模型。"""
+    global CHAT_PROFILE, CHAT_PROVIDER
+    model, base, key = _chat_defaults()
+    DIRECT.set_model(model=model, base_url=base, api_key=key, proxy="")
+    CHAT_PROFILE, CHAT_PROVIDER = modelprofiles.DEFAULT_PROFILE, "default"
+    return bool(key and base)
+
+
+def apply_model(profile: str = "", autostart: bool = True):
+    """切换**闲聊**模型档案。任务不受这个影响，永远走 DeepSeek。
+
+    返回 (成功?, 给主人看的一句话)。profile 支持 flash（DeepSeek）/ grok（bee）。
+    """
+    global CHAT_PROFILE, CHAT_PROVIDER
+    name = modelprofiles.canonical(profile)
+    spec = modelprofiles.spec_for(name)
+    if not spec:
+        return False, ("闲聊模型只支持：grok（Grok 4.7 · bee）/ flash（DeepSeek）。\n"
+                       "任务固定走 DeepSeek，不随这个切换。")
+    if spec["provider"] == "bee":
+        cred = modelprofiles.bee_credentials(BEE_SETTINGS_PATH)
+        if not cred:
+            return False, f"bee 配置读不到：{BEE_SETTINGS_PATH}（要 base_url + token）"
+        if not _ensure_proxy(autostart=autostart):
+            return False, f"bee 要走本地代理，{BEE_PROXY} 没开；先启动 Pigeon 再试"
+        DIRECT.set_model(model=spec["model"], base_url=cred["base_url"],
+                         api_key=cred["api_key"], proxy=BEE_PROXY)
+        CHAT_PROFILE, CHAT_PROVIDER = name, "bee"
+    else:
+        _set_default_chat()
+    _save_chat_state()
+    return True, (f"🧠 闲聊已切到 {spec['label']}（{DIRECT.model}）\n"
+                  f"任务仍然是 DeepSeek（不随闲聊切换）")
+
+
+def _restore_model_state():
+    """启动 / 重载时把上次的闲聊档案接回来（不自动拉代理，别拖慢启动）。"""
+    global CHAT_PROFILE, CHAT_PROVIDER
+    name = modelprofiles.canonical(modelprofiles.load_state(MODEL_STATE_PATH).get("profile"))
+    if modelprofiles.spec_for(name):
+        ok, msg = apply_model(name, autostart=False)
+        if ok:
+            # logger 而不是 log()：log() 在这里还没定义（模块级调用发生在它之前）
+            logger.info("闲聊模型档案已恢复：%s", msg.replace("\n", " / "))
+            return
+        logger.warning("恢复闲聊档案 %s 失败：%s", name, msg)
+    # 没有档案 / 恢复失败：确保闲聊回落到默认端点（bee 不可用时别让直连哑掉）
+    try:
+        if not _set_default_chat():
+            logger.warning("默认闲聊端点没配好：DIRECT 可能不可用（检查 chat_direct / settings.json）")
+    except Exception as e:
+        logger.warning("默认闲聊端点恢复失败：%s", e)
+
+
+# 启动即恢复上次的档案：CFG 和 DIRECT 到这里都已就绪
+_restore_model_state()
 # 人格设定：闲聊与任务共用（文件不存在时为空，不影响运行）
 PERSONA_PATH = Path(CFG.get("persona_path") or (BASE / "persona.md"))
 # 风格人格包（WeClone-Skills 结构）：基础规则之外的"像不像本人"，改完 /重载 生效
@@ -444,6 +551,9 @@ def reload_config() -> dict:
         g["PUBLIC_DIRECT"] = bool(_d.get("public", True))
     except Exception as e:
         logger.warning("直连配置重载失败：%s", e)
+    # 上面重建了 DIRECT、也把 MODEL 重置成配置值 —— 但主人用 /model 切过的档案
+    # 不该因为一次 /重载 就被悄悄改回去，所以最后再按落盘状态接一次。
+    _restore_model_state()
     return {"group_policy": g["GROUP_POLICY"], "group_min_chars": g["GROUP_MIN_CHARS"]}
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
 STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
@@ -751,6 +861,8 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
     async def _once(use_resume: bool):
         # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
         base = list(CFG.get("claude_cmd") or [CLAUDE])
+        # 任务恒走默认 DeepSeek 配置：不加载 bee 的 --settings、不过代理。
+        # （/model 只影响闲聊直连通道，见「闲聊模型档案」一节。）
         fmt = "json" if is_public else ("stream-json" if STREAM_PROGRESS else "json")
         if is_public:
             # 公开通道只有"看网页"这一种能力：能查网上资料，碰不到本机
@@ -1712,6 +1824,7 @@ HELP = """命令（只列常用的，其余见 /帮助 全部）：
 /提醒列表   看还没到点的
 /重载   改完 config.json 不用重启
 /完整 <事>   这条任务放开全部工具和 MCP（默认只有六个工具、不加载 MCP）
+/model grok   换闲聊模型（grok / flash），任务永远 DeepSeek 不受影响
 发语音   直接说，本机转成文字（转不出来会说没听清）
 !<命令>   直接执行 PowerShell
 其他任何文字 = 自动判断闲聊或任务
@@ -1972,17 +2085,24 @@ async def handle_command(text: str) -> bool:
         await send("🏓 我在。")
         return True
 
-    if low.startswith("/model"):
-        arg = t[6:].strip()
-        global MODEL
+    if low.startswith("/model") or low.startswith("/模型"):
+        arg = t.split(maxsplit=1)[1].strip() if len(t.split(maxsplit=1)) > 1 else ""
         if not arg:
-            await send(f"当前模型：{MODEL or '（跟随默认配置）'}\n用法：/model <模型名>（用 default 恢复默认）")
-        elif arg.lower() in ("default", "默认"):
-            MODEL = CFG.get("model") or ""
-            await send("🧹 已恢复默认模型")
-        else:
-            MODEL = arg
-            await send(f"🧠 后续任务使用模型：{MODEL}")
+            lane = "bee（beeapi.ai）" if CHAT_PROVIDER == "bee" else "DeepSeek 直连"
+            await send(f"闲聊模型：{DIRECT.model} @ {lane}\n"
+                       f"任务模型：{MODEL or '端点默认'} @ DeepSeek（固定，不随闲聊切换）\n"
+                       f"切闲聊：/model grok | flash（deepseek）\n"
+                       f"状态落盘，重启也记得")
+            return True
+        if arg.lower() in ("list", "列表"):
+            lines = [f"{k} → {v['label']}（{v['model'] or '端点默认'}）"
+                     for k, v in MODEL_PROFILES.items()]
+            await send("闲聊可用的档案：\n" + "\n".join(lines) +
+                       "\n\n任务固定走 DeepSeek，不受影响")
+            return True
+        ok, msg = apply_model(profile=arg)
+        await send(("✅ " if ok else "⚠️ ") + msg)
+        log(f"/model → {arg}: {'ok' if ok else msg}")
         return True
 
     if low in ("/cost", "/花费"):

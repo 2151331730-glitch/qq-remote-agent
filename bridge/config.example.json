@@ -74,5 +74,24 @@
     "timeout_seconds": 180,
     "python": "",
     "model_dir": ""
+  },
+  "model": "",
+  "bee_settings_path": "",
+  "bee_proxy": "http://127.0.0.1:7892",
+  "bee_autostart_proxy": true,
+  "chat_direct": {
+    "enabled": true,
+    "owner": true,
+    "public": true,
+    "base_url": "https://api.deepseek.com/anthropic",
+    "api_key": "CHANGE_ME_or_leave_empty",
+    "model": "deepseek-v4-flash",
+    "proxy": "",
+    "max_tokens": 400,
+    "temperature": 1.0,
+    "history_turns": 20,
+    "timeout_seconds": 60,
+    "stream": true,
+    "history_path": ""
   }
 }

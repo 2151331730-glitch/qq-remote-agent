@@ -32,7 +32,8 @@ Claude Code 系统提示、以及自动读的 CLAUDE.md/AGENTS.md。实测在空
       "temperature": 1.0,
       "history_turns": 20,             // 带最近几轮进上下文（一问一答算一轮）
       "timeout_seconds": 60,
-      "stream": true
+      "stream": true,
+      "proxy": ""                      // 例如 http://127.0.0.1:7892（bee 在国内必须走代理）
     }
 
 `api_key` / `base_url` 不打印、不落日志。
@@ -112,6 +113,9 @@ class DirectChat:
         self.history_turns = int(cfg.get("history_turns", 20))
         self.timeout = int(cfg.get("timeout_seconds", 60))
         self.stream = bool(cfg.get("stream", True))
+        # 走代理时才建 opener：DeepSeek 国内直连，套代理只会多一跳
+        self.proxy = str(cfg.get("proxy") or "").strip()
+        self._opener = None
         # 历史持久化：重启后上下文还在，不用从聊天记录重新猜
         self.store_path = Path(cfg.get("history_path") or "") if cfg.get("history_path") else None
         if self.enabled and (not self.api_key or not self.base_url):
@@ -179,6 +183,33 @@ class DirectChat:
         if not self.available():
             return "直连缺 key/base_url"
         return f"直连 {self.model}"
+
+    def set_model(self, model: str = "", base_url: str = "", api_key: str = "",
+                  proxy: str | None = None):
+        """热切换模型 / 端点，**不动已有历史**（换模型不该把聊天接不上）。
+
+        只更新传进来的字段：换端点时 key 和 base_url 要一起给，否则会出现
+        "bee 的 key + DeepSeek 的地址"这种 401。
+        proxy=None 表示不改；proxy="" 表示回到直连。
+        """
+        if model:
+            self.model = model
+        if base_url:
+            self.base_url = base_url.rstrip("/")
+        if api_key:
+            self.api_key = api_key
+        if proxy is not None:
+            self.proxy = str(proxy).strip()
+            self._opener = None
+
+    def _open(self, req, timeout: float):
+        """发请求。配了 proxy 就走本地代理，否则直连。"""
+        if self.proxy:
+            if self._opener is None:
+                self._opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
+            return self._opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
 
     # ---------------- 上下文 ----------------
 
@@ -299,7 +330,7 @@ class DirectChat:
 
         started = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._open(req, self.timeout) as resp:
                 if payload.get("stream"):
                     reply = self._read_stream(resp, on_delta)
                 else:
