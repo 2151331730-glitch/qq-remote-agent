@@ -18,7 +18,11 @@ DB = TMP / "test5.db"
 LOG_DIR = TMP / "logs5"
 LOG_DIR.mkdir(exist_ok=True)
 
+# 刻意记录用的是哪份配置：CI 上只有 config.example.json（没有 key → 走 claude 回退通道），
+# 本地有 config.json（有 key → 走直连通道）。两条通道的差异曾经让一个 TypeError
+# 只在 CI 炸、本地全绿。跑完看这一行就知道这次覆盖的是哪条路。
 base_name = "config.json" if (ROOT / "bridge" / "config.json").exists() else "config.example.json"
+print(f"[mock] 配置来源：bridge/{base_name}")
 cfg = json.loads((ROOT / "bridge" / base_name).read_text(encoding="utf-8"))
 cfg.update({"napcat_token": "test-token", "panel_token": "test-panel",
             "workdir": str(TMP),
@@ -98,7 +102,39 @@ async def main():
         bridge = subprocess.Popen([sys.executable, str(ROOT / "bridge" / "bridge.py")],
                                   cwd=str(ROOT / "bridge"), env=env,
                                   stdout=bridge_log, stderr=subprocess.STDOUT)
-        await asyncio.sleep(38)
+
+        # 不再固定睡 38 秒：CI 机器慢的时候任务还没跑完就被 terminate，
+        # 表现为"任务卡在 running"，其实是测试自己把它杀了。
+        # 改成轮询"任务是否已进入终态"，最多等 90 秒。
+        import sqlite3 as _sq
+        import time as _t
+
+        def _settled():
+            try:
+                c = _sq.connect(DB)
+                rows = list(c.execute("SELECT state FROM tasks"))
+                c.close()
+            except Exception:
+                return False
+            if not rows:
+                return False
+            return all(r[0] in ("succeeded", "failed", "cancelled", "interrupted")
+                       for r in rows)
+
+        deadline = _t.monotonic() + 90
+        while _t.monotonic() < deadline:
+            if _settled():
+                print("[mock] 任务已进入终态", flush=True)
+                # 再给几秒让最后一条回复发出去
+                await asyncio.sleep(3)
+                break
+            if bridge.poll() is not None:
+                print(f"[mock] bridge 提前退出，code={bridge.returncode}", flush=True)
+                break
+            await asyncio.sleep(1)
+        else:
+            print("[mock] 等待超时，按当前状态终止", flush=True)
+
         bridge.terminate()
         try:
             bridge.wait(timeout=10)
@@ -124,4 +160,7 @@ if not rows:
             print(f.read_text(encoding="utf-8", errors="replace")[-2000:])
 assert len(rows) == 1, f"期望 1 条任务（重复投递应被幂等丢弃），实际 {len(rows)}"
 assert rows[0][1] == "succeeded", f"任务状态应为 succeeded，实际 {rows[0][1]}"
+# worker 一旦因异常静默退出，后面的任务会永远停在 queued/running。
+# 这条断言把"worker 还活着"显式化，而不是等到下一条任务超时才发现。
+assert rows[0][1] != "running", "worker 可能在执行中异常退出了"
 print("\n✅ 断言通过：1 条任务、succeeded、重复投递被丢弃")

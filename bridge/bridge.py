@@ -871,7 +871,28 @@ async def worker(wid: int):
         cwd = row.get("cwd") or STATE.get("cwd") or WORKDIR
         lock = await _cwd_lock(cwd)
         async with lock:
-            await _execute(row, cwd)
+            # 兜底：_execute 里任何未预料的异常都不能让 worker 静默死掉。
+            # 之前的教训——`_execute_claude_chat` 签名不匹配抛 TypeError，
+            # worker 直接终止，任务永远停在 running，而日志里只有一条
+            # "Task exception was never retrieved"，很容易被忽略。
+            try:
+                await _execute(row, cwd)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("worker 执行异常（任务 %s）", tid)
+                try:
+                    STORE.finish(tid, "failed", error=f"{type(e).__name__}: {e}",
+                                 error_kind="exception")
+                except Exception:
+                    pass
+                METRICS.inc("qq_remote_tasks_total", {"state": "failed"})
+                METRICS.inc("qq_remote_task_errors_total", {"kind": "exception"})
+                try:
+                    await send(f"⚠️ 任务 {tid} 内部异常：{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                _cleanup(tid)
 
 
 async def _deliver_human(body: str, tid: str) -> bool:
@@ -1001,7 +1022,7 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
         log(f"直连失败（{DIRECT.last_error}），回退 claude.exe")
         STATE["current_task"] = ""
         save_state()
-        return await _execute_claude_chat(row, text)
+        return await _execute_claude_chat(row, WORKDIR)
 
     body = _plain(reply)
     STORE.finish(tid, "succeeded", result=body, exit_code=0, cost_usd=0.0,
@@ -1045,7 +1066,7 @@ async def _execute(row, cwd):
     # 闲聊优先走直连：省钱的代价是没工具，但闲聊本来就不需要工具
     if kind == "chat" and OWNER_DIRECT and DIRECT.available():
         return await _execute_direct_chat(row, text, scope="owner")
-    return await _execute_claude_chat(row, text, cwd)
+    return await _execute_claude_chat(row, cwd)
 
 
 async def _execute_claude_chat(row, cwd):

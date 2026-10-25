@@ -334,3 +334,65 @@ def test_seed_keeps_meaningful_short_replies():
     contents = " ".join(m["content"] for m in c.history_for("owner"))
     assert "明天考试" in contents
     assert "祝你顺利" in contents
+
+
+# ---------------- 分流与回退的接线（防止签名不匹配这类"只在 CI 才炸"的问题）--------------
+
+def test_execute_falls_back_with_the_right_signature(monkeypatch):
+    """直连不可用时必须能真的回退到 claude 路径。
+
+    回归自一个真实事故：`_execute()` 调用 `_execute_claude_chat(row, text, cwd)`
+    多传了一个参数，而直连可用时根本走不到那行 —— 本地（有 key）一直绿，
+    CI（无 key）必然 TypeError，worker 静默死掉、任务卡在 running。
+    """
+    import asyncio
+    import bridge as br
+
+    called = {}
+
+    async def fake_claude_chat(row, cwd):
+        called["args"] = (row, cwd)
+        return "claude-lane"
+
+    monkeypatch.setattr(br, "OWNER_DIRECT", False)
+    monkeypatch.setattr(br, "_execute_claude_chat", fake_claude_chat)
+    monkeypatch.setattr(br, "_execute_direct_chat", None, raising=False)
+
+    row = {"id": "t1", "text": "在吗", "kind": "chat"}
+    out = asyncio.run(br._execute(row, r"C:\tmp"))
+    assert out == "claude-lane"
+    assert called["args"][1] == r"C:\tmp"
+
+
+def test_direct_failure_falls_back_too(monkeypatch):
+    """直连配置在但调用失败时，同样要落回 claude 路径，不能卡住。"""
+    import asyncio
+    import bridge as br
+
+    async def boom(*a, **k):
+        return "", False
+
+    calls = []
+
+    async def fake_claude_chat(row, cwd):
+        calls.append(cwd)
+        return "fallback"
+
+    monkeypatch.setattr(br, "OWNER_DIRECT", True)
+    monkeypatch.setattr(br, "DIRECT", type("D", (), {
+        "available": lambda self: True,
+        "history_for": lambda self, s: [],
+        "seed_history": lambda self, s, t: 0,
+        "ask": lambda *a, **k: (_ for _ in ()).throw(OSError("net down")),
+        "last_usage": {"in": 0, "out": 0},
+        "last_error": "net down",
+    })())
+    monkeypatch.setattr(br, "_execute_claude_chat", fake_claude_chat)
+    monkeypatch.setattr(br, "_file_context", lambda scope: "")
+
+    row = {"id": "t2", "text": "在吗", "kind": "chat", "source": "qq"}
+    out = asyncio.run(br._execute(row, r"C:\tmp"))
+    assert out == "fallback"
+    # 直连内部回退时用 WORKDIR 作为工作目录（历史遗留行为，不是调用方的 cwd）。
+    # 这条测试只保证"确实回退了、没有再卡在直连里"。
+    assert len(calls) == 1
