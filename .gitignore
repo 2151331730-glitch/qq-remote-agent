@@ -36,3 +36,12 @@ tools/monitor/*
 !tools/monitor/dashboards/
 !tools/monitor/start-monitoring.ps1
 docs/bench/*.json
+chat_history.json
+
+# 私有：内部运维手册与开发日志（含真实 QQ 号、私聊内容、本机路径），只在本地保留
+progress.md
+CLAUDE.md
+HANDOFF.md
+使用说明.md
+tests/tmp/
+bridge/*.bak*

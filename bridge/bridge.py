@@ -36,6 +36,8 @@ import context as context_mod
 import history
 import policy
 import chatstyle
+import humantype
+from direct import DirectChat
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
 from metrics import METRICS
@@ -91,8 +93,20 @@ STREAM_TEXT = bool(CFG.get("stream_text", True))
 STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
 STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
 MODEL = CFG.get("model") or ""
+# 直连通道：闲聊不走 claude.exe，直接 POST /v1/messages。
+# claude.exe 每次调用固定 1.1~3 万输入 token（工具定义 + MCP + 系统提示），
+# 而闲聊的上下文上限才 3 万 —— 等于每句话都在换会话、每句话都在付壳的钱。
+# 直连之后一句闲聊 200~2000 token、0.8~1.6 秒，且上下文真的能连续。
+DIRECT = DirectChat(CFG.get("chat_direct") or {})
+# 主人闲聊也走直连（默认开）；关掉就退回 claude.exe 的老路径
+OWNER_DIRECT = bool((CFG.get("chat_direct") or {}).get("owner", True))
+# 公开通道也走直连（群聊/陌生人本来就只陪聊，不需要工具）
+PUBLIC_DIRECT = bool((CFG.get("chat_direct") or {}).get("public", True))
 # 人格设定：闲聊与任务共用（文件不存在时为空，不影响运行）
 PERSONA_PATH = Path(CFG.get("persona_path") or (BASE / "persona.md"))
+# 风格人格包（WeClone-Skills 结构）：基础规则之外的"像不像本人"，改完 /重载 生效
+PERSONA_PACK_DIR = Path(CFG.get("persona_pack_dir") or (BASE / "persona-pack"))
+PERSONA_PACK_FILES = ("profile.md", "persona_examples.md", "state.md", "guardrails.md")
 # 长期记忆（纯文本，一行一条）：只在闲聊通道注入提示词
 MEMORY_PATH = Path(CFG.get("memory_path") or (BASE / "memory.md"))
 # 两套提示词：闲聊默认原话直发；任务保留执行语义但去掉模板腔
@@ -155,6 +169,13 @@ PUBLIC_BUBBLE_LIMIT = int(CFG.get("public_bubble_max_chars", 140))
 PUBLIC_BUBBLE_PARTS = int(CFG.get("public_bubble_max_parts", 3))
 PUBLIC_BUBBLE_DELAY = float(CFG.get("public_bubble_delay", 0.7))
 
+# 主人私聊也分条发：真人不会一秒甩完两百字，这是最便宜的"像人"手段
+OWNER_BUBBLES = bool(CFG.get("owner_bubbles", True))
+OWNER_BUBBLE_MIN = int(CFG.get("owner_bubble_min_chars", 60))
+OWNER_BUBBLE_LIMIT = int(CFG.get("owner_bubble_max_chars", 160))
+OWNER_BUBBLE_PARTS = int(CFG.get("owner_bubble_max_parts", 3))
+OWNER_BUBBLE_DELAY = float(CFG.get("owner_bubble_delay", 1.8))
+
 # 自动读上下文：回复前拉最近若干条消息压成摘录（群聊拉群历史，私聊拉对方历史）
 CONTEXT_ENABLED = bool(CFG.get("context_enabled", True))
 CONTEXT_MESSAGES = int(CFG.get("context_messages", 12))
@@ -195,12 +216,23 @@ RSTORE = ReminderStore(REMINDER_DB)
 
 
 def _load_persona() -> str:
+    parts = []
     try:
         if PERSONA_PATH.exists():
-            return PERSONA_PATH.read_text(encoding="utf-8").strip()
+            parts.append(PERSONA_PATH.read_text(encoding="utf-8").strip())
     except Exception as e:
         logger.warning("persona load failed: %s", e)
-    return ""
+    # 风格人格包：逐个文件读，缺哪个都不影响启动
+    for name in PERSONA_PACK_FILES:
+        p = PERSONA_PACK_DIR / name
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8").strip()
+                if txt:
+                    parts.append(txt)
+        except Exception as e:
+            logger.warning("persona pack load failed %s: %s", name, e)
+    return "\n\n".join(x for x in parts if x)
 
 
 PERSONA = _load_persona()
@@ -304,6 +336,11 @@ def reload_config() -> dict:
     g["PUBLIC_BUBBLE_LIMIT"] = int(CFG.get("public_bubble_max_chars", 140))
     g["PUBLIC_BUBBLE_PARTS"] = int(CFG.get("public_bubble_max_parts", 3))
     g["PUBLIC_BUBBLE_DELAY"] = float(CFG.get("public_bubble_delay", 0.7))
+    g["OWNER_BUBBLES"] = bool(CFG.get("owner_bubbles", True))
+    g["OWNER_BUBBLE_MIN"] = int(CFG.get("owner_bubble_min_chars", 60))
+    g["OWNER_BUBBLE_LIMIT"] = int(CFG.get("owner_bubble_max_chars", 160))
+    g["OWNER_BUBBLE_PARTS"] = int(CFG.get("owner_bubble_max_parts", 3))
+    g["OWNER_BUBBLE_DELAY"] = float(CFG.get("owner_bubble_delay", 1.8))
     g["CONTEXT_ENABLED"] = bool(CFG.get("context_enabled", True))
     g["CONTEXT_MESSAGES"] = int(CFG.get("context_messages", 12))
     g["CONTEXT_MAX_CHARS"] = int(CFG.get("context_max_chars", 1200))
@@ -320,6 +357,15 @@ def reload_config() -> dict:
         or "（手机 QQ 发来的任务，直接在本机执行）{task}\n"
            "做完用纯文本给一句结论，别用 Markdown 标题和表格。")
     g["PERSONA"] = _load_persona()
+    # 直连通道热重载：改 model / max_tokens / history_turns 不用重启，
+    # 但 base_url / api_key 变了要重启（这里也一并重建，反正很快）
+    try:
+        _d = CFG.get("chat_direct") or {}
+        g["DIRECT"] = DirectChat(_d)
+        g["OWNER_DIRECT"] = bool(_d.get("owner", True))
+        g["PUBLIC_DIRECT"] = bool(_d.get("public", True))
+    except Exception as e:
+        logger.warning("直连配置重载失败：%s", e)
     return {"group_policy": g["GROUP_POLICY"], "group_min_chars": g["GROUP_MIN_CHARS"]}
 # 队列后端：sqlite（默认，单机）| redis（多进程/多机共享，见 store_redis.py）
 STORE_BACKEND = str(CFG.get("store_backend") or "sqlite").lower()
@@ -435,14 +481,32 @@ async def send(text: str) -> bool:
     return True
 
 
-async def deliver(text: str, task_id=None) -> bool:
-    """先落发件箱再发；失败留在库里，重连后补发——避免 NapCat 断线时结果永久丢失。"""
+async def _send_owner_bubbles(body: str) -> bool:
+    """给主人回话时分条发，条间随机停顿——模仿打字节奏。"""
+    parts = (chatstyle.split_bubbles(body, OWNER_BUBBLE_MIN, OWNER_BUBBLE_LIMIT,
+                                     OWNER_BUBBLE_PARTS)
+             if OWNER_BUBBLES else [body])
+    ok = True
+    for i, part in enumerate(parts):
+        if i:
+            await asyncio.sleep(random.uniform(0.8, max(1.0, OWNER_BUBBLE_DELAY)))
+        if not await send(part):
+            ok = False
+            break
+    return ok
+
+
+async def deliver(text: str, task_id=None, bubbles=False) -> bool:
+    """先落发件箱再发；失败留在库里，重连后补发——避免 NapCat 断线时结果永久丢失。
+
+    bubbles=True 时按真人节奏分条发送（发件箱仍记整条，补发不会碎片化）。
+    """
     oid = None
     try:
         oid = STORE.outbox_add(text, task_id)
     except Exception as e:
         logger.warning("outbox add failed: %s", e)
-    ok = await send(text)
+    ok = await (_send_owner_bubbles(text) if bubbles else send(text))
     if oid is not None:
         try:
             STORE.outbox_mark(oid, ok, None if ok else "send failed")
@@ -810,7 +874,181 @@ async def worker(wid: int):
             await _execute(row, cwd)
 
 
+async def _deliver_human(body: str, tid: str) -> bool:
+    """按真人的节奏把回复发出去。
+
+    三道加工，都按实测数据定的（275 条真人发言的统计，见 humantype.py）：
+    1. `humanize()` 去书面标点 —— 真人 99% 不打句号，这是最刺眼的机器味
+    2. `split_like_human()` —— 真人 84% 只发一条，默认就不拆
+    3. `compose_timeline()` —— 首条 1.5~4 秒，不秒回
+    """
+    text = humantype.humanize(body) or body
+    parts = (humantype.split_like_human(text, max_parts=OWNER_BUBBLE_PARTS)
+             if OWNER_BUBBLES else [text])
+    if not parts:
+        return False
+    delays = humantype.compose_timeline(parts)
+    ok = True
+    for i, part in enumerate(parts):
+        if delays[i] > 0:
+            await asyncio.sleep(delays[i])
+        if not await send(part):
+            ok = False
+            break
+    if ok:
+        try:
+            STORE.outbox_add(body, tid)
+        except Exception:
+            pass
+    return ok
+
+
+def _direct_system() -> str:
+    """直连通道的系统提示：人格 + 长期记忆 + 聊天格式约束。
+
+    格式那段不是随便写的——它是把 275 条**真人**发言的统计结论直接喂给模型：
+
+    | 特征 | 真人实测 |
+    |---|---|
+    | 句末打标点 | 0% |
+    | 含句号 | 1%（4/275） |
+    | 完全不带标点 | 68% |
+    | 每条字数 | 中位 11，p90 为 23，最长 50 |
+    | 一轮发几条 | 84% 只发 1 条 |
+
+    这些数字比"像真人一点"这种形容词有效得多——模型会照着具体指标生成。
+    就算它没照做，`humantype.humanize()` 还会再兜一层去标点。
+    """
+    parts = [PERSONA] if PERSONA else []
+    try:
+        mem = memory.load(MEMORY_PATH) if MEMORY_PATH else ""
+    except Exception:
+        mem = ""
+    if mem:
+        parts.append("（你记得的关于主人的事，自然用上，别逐条复述：\n" + mem + "）")
+    parts.append(CHAT_STYLE_RULE)
+    parts.append(ESCALATE_RULE)
+    return "\n\n".join(p for p in parts if p)
+
+
+# 聊天格式约束：直接写真人聊天的实测数据，比任何形容词都管用
+CHAT_STYLE_RULE = (
+    "（现在是手机 QQ 私聊，按下面对真人聊天的实测数据来说话——\n"
+    "· 每条 10~20 字，最多别超过 30 字。实测真人中位 11 字，90% 在 23 字以内\n"
+    "· **不要打句号**。实测 275 条真人消息里只有 4 条有句号（1%），68% 完全不带标点\n"
+    "· 要断开就用逗号，或者干脆不断，一口气说完\n"
+    "· 感叹号和问号可以有，但别滥用\n"
+    "· **默认只回一条**。实测 84% 的时候真人只发一条消息。只有真的说不完"
+    "才换行分成两条，绝对不要发三条以上\n"
+    "· 不用 Markdown：标题、表格、列表、代码块、加粗一律不要\n"
+    "· 不要总结对方刚说的话，不要「首先其次最后」，不要客服腔"
+    "（「好的」「希望对你有帮助」「还有什么可以帮您」）\n"
+    "· 不要每句都带 emoji）")
+
+
+# 轻通道里"要动电脑"的暗号：模型没法执行命令，但可以把要做的活交回重通道。
+# 这样闲聊通道一句 200 token，真需要动手时才付 3 万 —— 而不是每句话都付。
+ESCALATE_RULE = (
+    "（你手上没有工具，碰不到这台电脑。如果这件事必须看本机的文件、跑命令、"
+    "查进程或改东西才能答，就**别猜**，单独写一行：\n"
+    "[[做：要执行的具体指令]]\n"
+    "系统会派人去做，结果回来再说。一句话只能有一个 [[做：…]]。"
+    "纯聊天、讲道理、凭常识能答的，绝对不要用它。）")
+
+_ESCALATE = re.compile(r"\[\[\s*做\s*[：:]\s*(.+?)\s*\]\]", re.S)
+
+
+def _split_escalation(reply: str):
+    """把回复拆成 (给用户看的话, 要转成任务的指令或空串)。"""
+    m = _ESCALATE.search(reply or "")
+    if not m:
+        return (reply or "").strip(), ""
+    task = m.group(1).strip()
+    rest = _ESCALATE.sub("", reply).strip()
+    return rest, task
+
+
+async def _execute_direct_chat(row, text: str, scope: str = "owner"):
+    """闲聊走直连：一次 HTTP，无子进程、无工具、上下文在内存里连续。"""
+    tid = row["id"]
+    started = time.time()
+    STATE["current_task"] = text
+    save_state()
+    audit(AUDIT_PATH, event="task_start", id=tid, source=row["source"], kind="chat",
+          text=text[:500], lane="direct")
+    log(f"闲聊开始（直连）[{tid}]：{text[:200]}")
+
+    # 内存里没历史（刚重启/刚清空）时，用本地聊天记录垫底，接得上话
+    if not DIRECT.history_for(scope):
+        try:
+            DIRECT.seed_history(scope, _file_context(scope))
+        except Exception as e:
+            logger.warning("直连垫底历史失败：%s", e)
+
+    reply, ok = "", False
+    try:
+        reply, ok = await asyncio.to_thread(
+            DIRECT.ask, scope, text, _direct_system(), None)
+    except Exception as e:
+        logger.exception("直连闲聊异常")
+        DIRECT.last_error = f"{type(e).__name__}: {e}"
+
+    seconds = time.time() - started
+    tin = int(DIRECT.last_usage.get("in") or 0)
+    tout = int(DIRECT.last_usage.get("out") or 0)
+    if not ok:
+        # 直连挂了就退回 claude.exe，别让主人对着沉默
+        log(f"直连失败（{DIRECT.last_error}），回退 claude.exe")
+        STATE["current_task"] = ""
+        save_state()
+        return await _execute_claude_chat(row, text)
+
+    body = _plain(reply)
+    STORE.finish(tid, "succeeded", result=body, exit_code=0, cost_usd=0.0,
+                 duration_ms=int(seconds * 1000), tokens_in=tin, tokens_out=tout)
+    METRICS.inc("qq_remote_tasks_total", {"state": "succeeded"})
+    METRICS.observe("qq_remote_task_duration_seconds", seconds)
+    METRICS.inc("qq_remote_tokens_total", {"direction": "in"}, tin)
+    METRICS.inc("qq_remote_tokens_total", {"direction": "out"}, tout)
+    audit(AUDIT_PATH, event="task_end", id=tid, source=row["source"], ok=True,
+          kind="chat", lane="direct", seconds=round(seconds, 2),
+          tokens_in=tin, tokens_out=tout, result=body[:2000])
+    STATE["last_chat"] = {"id": tid, "at": time.time(), "seconds": round(seconds, 2),
+                          "tokens_in": tin, "tokens_out": tout}
+    log(f"闲聊结束（直连）[{tid}]：{seconds:.2f}s tokens={tin}+{tout}")
+    speak, followup = _split_escalation(body)
+    # 只有真实来自 QQ 的消息才写进聊天记录。测试时往 tasks.db 里插的假任务
+    # 不该污染 `记忆/transcripts/`，否则下次垫底会把这些内容当成真实对话。
+    from_qq = row["source"] == "qq"
+    if speak:
+        await _deliver_human(speak, tid)
+        if from_qq:
+            _record("owner", int(CFG.get("bot_uin") or 0), "我", speak)
+    if followup:
+        # 模型决定这事得动电脑：立刻转成一条任务，结果另发
+        log(f"闲聊升级为任务：{followup[:120]}")
+        res = await submit_task(followup, "escalate", kind="task")
+        if res.get("status") == "queued":
+            if not speak:
+                await send("我看下")
+        else:
+            await send(f"想查一下但排不进去（{res.get('status')}），等会儿再问我。")
+    elif not speak:
+        await _deliver_human("（没说出话来）", tid)
+    _cleanup(tid)
+
+
 async def _execute(row, cwd):
+    tid = row["id"]
+    text = row["text"]
+    kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
+    # 闲聊优先走直连：省钱的代价是没工具，但闲聊本来就不需要工具
+    if kind == "chat" and OWNER_DIRECT and DIRECT.available():
+        return await _execute_direct_chat(row, text, scope="owner")
+    return await _execute_claude_chat(row, text, cwd)
+
+
+async def _execute_claude_chat(row, cwd):
     tid = row["id"]
     text = row["text"]
     kind = (row.get("kind") if hasattr(row, "get") else None) or "task"
@@ -911,16 +1149,16 @@ async def _execute(row, cwd):
     body = _plain(reply)
     if kind == "chat":
         # 闲聊：不要 ✅ 前缀、不要 ⏱ 尾巴，直接说话
-        await deliver(body or "（没有回话）", tid)
+        await deliver(body or "（没有回话）", tid, bubbles=True)
         _record("owner", int(CFG.get("bot_uin") or 0), "我", body)
     else:
         footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok" if SHOW_FOOTER else ""
-        await deliver(("✅ " if ok else "⚠️ ") + body + footer, tid)
+        await deliver(("✅ " if ok else "⚠️ ") + body + footer, tid, bubbles=True)
     if WORKERS == 1 and tin > session_limit(kind) and get_session(kind):
         STATE[session_key(kind)] = ""
         STATE[tokens_key(kind)] = 0
         save_state()
-        log(f"上下文自动重置（{kind}）：本次输入 {tin} token 超过上限 {SESSION_TOKEN_LIMIT}")
+        log(f"上下文自动重置（{kind}）：本次输入 {tin} token 超过上限 {session_limit(kind)}")
         if kind == "chat":
             await deliver("（聊得有点长了，我换了个新记忆继续；要紧的事再说一遍就好）", tid)
         else:
@@ -1103,19 +1341,40 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
             group_id=target_id if target_type == "group" else None,
             user_id=target_id if target_type == "private" else None)
     prompt = PUBLIC_TEMPLATE.replace("{task}", text)
-    if history_text:
-        prompt = ("以下是这个会话最近的消息（供你理解上下文，不要逐条复述；"
-                  "最后一条是对方刚说的）：\n" + history_text + "\n\n" + prompt)
-    try:
-        # 串行：同一时间只跑一次公开聊天，避免消息多时把机器和额度一起打满
-        async with PUBLIC_SEM:
-            ok, reply, cost, code, tin, tout, err = await run_claude(
-                prompt, tid, str(PUBLIC_WORKDIR), kind="public", scope=scope)
-    except Exception as e:
-        logger.exception("public chat error")
-        ok, reply, tin, tout, err = False, "", 0, 0, "exception"
-    finally:
-        PUBLIC_STATE["pending"] -= 1
+    reply, cost, tin, tout, err = "", 0.0, 0, 0, "ok"
+    ok = False
+    if PUBLIC_DIRECT and DIRECT.available():
+        # 公开通道本来就只陪聊，不需要工具 —— 直连比 claude.exe 便宜 100 倍以上。
+        # 上下文交给 DIRECT 的内存历史（第一次用本地记录垫底），不再塞进 prompt，
+        # 否则同一段历史会被算两次。
+        try:
+            sys_prompt = load_public_system() or PUBLIC_TEMPLATE
+            if not DIRECT.history_for(scope):
+                DIRECT.seed_history(scope, history_text)
+            got, ok = await asyncio.to_thread(
+                DIRECT.ask, scope, text, sys_prompt, None)
+            if ok:
+                reply = _plain(got)
+                tin = int(DIRECT.last_usage.get("in") or 0)
+                tout = int(DIRECT.last_usage.get("out") or 0)
+            else:
+                log(f"公开聊天直连失败（{DIRECT.last_error}），回退 claude.exe")
+        except Exception as e:
+            logger.exception("公开聊天直连异常")
+            ok = False
+    if not ok:
+        if history_text:
+            prompt = ("以下是这个会话最近的消息（供你理解上下文，不要逐条复述；"
+                      "最后一条是对方刚说的）：\n" + history_text + "\n\n" + prompt)
+        try:
+            # 串行：同一时间只跑一次公开聊天，避免消息多时把机器和额度一起打满
+            async with PUBLIC_SEM:
+                ok, reply, cost, code, tin, tout, err = await run_claude(
+                    prompt, tid, str(PUBLIC_WORKDIR), kind="public", scope=scope)
+        except Exception as e:
+            logger.exception("public chat error")
+            ok, reply, tin, tout, err = False, "", 0, 0, "exception"
+    PUBLIC_STATE["pending"] -= 1
 
     body = _plain(reply or "").strip() or "（我这边没说出话来，再说一遍试试？）"
     body = body[:PUBLIC_MAX_REPLY]
@@ -1426,6 +1685,11 @@ async def handle_command(text: str) -> bool:
         STATE["session_id"] = ""
         STATE["chat_session_id"] = ""
         save_state()
+        # 直连通道的上下文在内存里，也要一起清，否则"换新会话"只换了任务侧
+        try:
+            DIRECT.reset()
+        except Exception:
+            pass
         await send("🧹 已开新会话（闲聊和任务都清空了）。")
         return True
 
