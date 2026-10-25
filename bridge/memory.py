@@ -15,7 +15,11 @@ HEADER = "# 长期记忆（一行一条，越靠后越新；由 /记住 或手�
 
 
 def load(path, max_chars: int = MAX_CHARS) -> str:
-    """读记忆正文（不含标题行）；文件不存在或读失败时返回空串。"""
+    """读记忆正文（不含注释行）；文件不存在或读失败时返回空串。
+
+    **去掉所有 `#` 开头的行为**。原来只跳过第一行，于是模板里的说明注释
+    （"这个文件是私人内容…"）会被当成记忆注入提示词 —— 它"记得"的是注释。
+    """
     p = Path(path)
     if not p.exists():
         return ""
@@ -23,13 +27,31 @@ def load(path, max_chars: int = MAX_CHARS) -> str:
         raw = p.read_text(encoding="utf-8")
     except Exception:
         return ""
-    lines = [ln for ln in raw.splitlines() if ln.strip()]
-    if lines and lines[0].startswith("#"):
-        lines = lines[1:]
+    lines = [ln for ln in raw.splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
     body = "\n".join(lines).strip()
     if len(body) > max_chars:
         body = body[-max_chars:]
     return body
+
+
+def entries(path) -> list[str]:
+    """当前所有记忆条目（已去掉注释与空行）。给 /记忆 和去重用。"""
+    body = load(path, max_chars=10**9)
+    return [ln for ln in body.splitlines() if ln.strip()]
+
+
+def remove(path, needle: str) -> int:
+    """删掉包含 `needle` 的条目，返回删除条数。空串不匹配任何东西。"""
+    needle = (needle or "").strip()
+    if not needle:
+        return 0
+    keep = [ln for ln in entries(path) if needle not in ln]
+    removed = len(entries(path)) - len(keep)
+    if removed:
+        out = "\n".join([HEADER] + keep) + "\n"
+        Path(path).write_text(out, encoding="utf-8")
+    return removed
 
 
 def append(path, text: str, max_chars: int = MAX_CHARS) -> str:

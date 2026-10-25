@@ -47,3 +47,7 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: python tests/mock_test6.py
+      - name: 从聊天学习规则（mock_test_learn）
+        env:
+          PYTHONUTF8: "1"
+        run: python tests/mock_test_learn.py

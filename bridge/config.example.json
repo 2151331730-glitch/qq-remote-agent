@@ -56,5 +56,6 @@
   "public_bubble_min_chars": 80,
   "public_bubble_max_chars": 140,
   "public_bubble_max_parts": 3,
-  "public_bubble_delay": 0.7
+  "public_bubble_delay": 0.7,
+  "rules_path": ""
 }

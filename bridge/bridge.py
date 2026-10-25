@@ -32,6 +32,7 @@ from websockets.asyncio.client import connect
 
 import sandbox
 import memory
+import rules
 import context as context_mod
 import history
 import policy
@@ -109,6 +110,11 @@ PERSONA_PACK_DIR = Path(CFG.get("persona_pack_dir") or (BASE / "persona-pack"))
 PERSONA_PACK_FILES = ("profile.md", "persona_examples.md", "state.md", "guardrails.md")
 # 长期记忆（纯文本，一行一条）：只在闲聊通道注入提示词
 MEMORY_PATH = Path(CFG.get("memory_path") or (BASE / "memory.md"))
+# 从聊天里学到的行为规则（B 类）。和 memory.md 的区别：
+# 这里是**能机械检查**的形式约束，发出前跑一遍；memory 是给模型看的背景信息。
+RULES_PATH = Path(os.environ.get("QQ_REMOTE_RULES")
+                  or CFG.get("rules_path") or (BASE / "rules.json"))
+RULES = rules.RuleStore(RULES_PATH)
 # 两套提示词：闲聊默认原话直发；任务保留执行语义但去掉模板腔
 CHAT_TEMPLATE = str(CFG.get("chat_prompt_template") or "")
 TASK_TEMPLATE = str(CFG.get("task_prompt_template") or CFG.get("prompt_template")
@@ -357,6 +363,13 @@ def reload_config() -> dict:
         or "（手机 QQ 发来的任务，直接在本机执行）{task}\n"
            "做完用纯文本给一句结论，别用 Markdown 标题和表格。")
     g["PERSONA"] = _load_persona()
+    # 规则文件是外部可改的（/规则、手工编辑），/重载 时重新读一遍，
+    # 否则"加了规则但没生效"会很难查。
+    try:
+        g["RULES_PATH"] = Path(CFG.get("rules_path") or (BASE / "rules.json"))
+        g["RULES"] = rules.RuleStore(g["RULES_PATH"])
+    except Exception as e:
+        logger.warning("规则重载失败：%s", e)
     # 直连通道热重载：改 model / max_tokens / history_turns 不用重启，
     # 但 base_url / api_key 变了要重启（这里也一并重建，反正很快）
     try:
@@ -895,6 +908,70 @@ async def worker(wid: int):
                 _cleanup(tid)
 
 
+async def _learn_from_message(text: str) -> str:
+    """从主人这句话里学点东西。返回要追加给用户看的极短回执（没有就空串）。
+
+    设计原则（对应"想学但不要太容易改变"）：
+    - **显式纠正**（「下次别…」「太长了」）→ 尝试生成 B 类规则，立刻生效
+    - **弱信号**（「不喜欢被告知」）→ 只写 A 类记忆，不动行为
+    - **认不准就不学**：宁可漏一次，也不造一条错规则影响之后所有回复
+    - 回执极短，且只在真的写入了东西时才发（不制造新噪音）
+    """
+    plain = re.sub(r"（[^）]*）\n", "", text or "").strip()
+    if not plain:
+        return ""
+
+    hit, strength = rules.looks_like_correction(plain)
+    if not hit:
+        return ""
+
+    learned = []
+
+    # B 类：显式纠正 → 规则
+    if strength == "explicit":
+        rule = rules.infer_rule(plain)
+        if rule:
+            ok, why = RULES.add(rule["kind"], rule["value"], note=rule.get("note", ""))
+            if ok:
+                log(f"学到规则：{rule['kind']}={rule['value']}（{plain[:40]}）")
+                audit(AUDIT_PATH, event="rule_learned", kind=rule["kind"],
+                      value=str(rule["value"]), text=plain[:200])
+                learned.append("规则")
+            else:
+                log(f"规则未加入：{why}")
+        # B 类认不出来时，也要落一条 A 类，绝不静默丢弃
+        if not learned:
+            if _remember_once(plain):
+                learned.append("记忆")
+
+    # A 类：弱信号 → 记忆（去重，不重复写同一条）
+    elif strength == "soft":
+        if _remember_once(plain):
+            learned.append("记忆")
+
+    if not learned:
+        return ""
+    # 极短回执，只报"记了什么"，不复述原文
+    return "记下了"
+
+
+def _remember_once(text: str) -> bool:
+    """写一条偏好进 memory；已经有相似内容就不重复写。"""
+    try:
+        existing = memory.entries(MEMORY_PATH)
+        # 简单去重：已有条目里包含这句话的核心片段就跳过
+        core = re.sub(r"\s+", "", text)[:12]
+        if core and any(core in re.sub(r"\s+", "", e) for e in existing):
+            return False
+        memory.append(MEMORY_PATH, text)
+        log(f"学到偏好：{text[:60]}")
+        audit(AUDIT_PATH, event="pref_learned", text=text[:200])
+        return True
+    except Exception as e:
+        logger.warning("写记忆失败：%s", e)
+        return False
+
+
 async def _deliver_human(body: str, tid: str) -> bool:
     """按真人的节奏把回复发出去。
 
@@ -904,6 +981,14 @@ async def _deliver_human(body: str, tid: str) -> bool:
     3. `compose_timeline()` —— 首条 1.5~4 秒，不秒回
     """
     text = humantype.humanize(body) or body
+    # 学到的行为规则在这里生效：**发出前**用代码检查一遍，不靠模型自觉。
+    # 这是「下次别这么说」真的管用的关键。
+    text, fired = RULES.apply(text)
+    if fired:
+        log(f"规则生效：{'；'.join(fired[:3])}")
+    if not text:
+        # 规则把整条删空了（比如内容全是那句反问）——别发空气
+        text = "好"
     parts = (humantype.split_like_human(text, max_parts=OWNER_BUBBLE_PARTS)
              if OWNER_BUBBLES else [text])
     if not parts:
@@ -1493,34 +1578,21 @@ async def reminder_loop():
 
 # ---------------- 命令 ----------------
 
-HELP = """命令：
-/状态 看运行状态（含 p95 时延、成功率）
-/任务 [n] 最近任务列表（带 ID）
-/详情 上次任务花了多久、多少 token
-/停止 中断当前任务
-/取消 <ID> 取消排队中的任务
-/清空 清空排队中的任务
-/确认 执行待确认的危险操作
-/取消 放弃待确认的操作（/取消 <ID> = 取消排队中的某条）
-/新会话 清空对话上下文（闲聊和任务都清）
-/重载 改完 config.json 不用重启，重读配置
-/记住 <内容> 记进长期记忆（例：/记住 周三下午有课）
-/记忆 看长期记忆里记了什么
-/提醒 20:30 交作业 到点提醒（也支持 明天 8:00 / 10-25 20:30 / +10m）
-/提醒列表 看还没到点的提醒
-/取消提醒 <ID> 取消一条提醒
-/日志 [n] 看最近日志
-/全文 看上次完整结果
-/cd <路径> 换工作目录
-/心跳 测试是否在线
-/model <名称> 切换模型（default 恢复）
-/cost 看 token 与花费
-/聊 <内容> 强制当成闲聊（不执行）
-/执行 <内容> 强制当成任务（去做）
-!<命令> 直接执行 PowerShell（例：!dir C:\\）
-!!<命令> 在沙箱里执行（WSL/Docker，隔离但只挂载当前目录）
+HELP = """命令（只列常用的，其余见 /帮助 全部）：
+/状态   运行状态、花费、当前在做什么
+/任务   最近任务列表
+/停止   中断当前任务
+/新会话 清空对话上下文
+/记住 <内容>   记一条长期记忆
+/记忆   看记住了什么（/忘 <关键词> 删掉）
+/提醒 20:30 交作业   到点提醒
+/提醒列表   看还没到点的
+/重载   改完 config.json 不用重启
+!<命令>   直接执行 PowerShell
 其他任何文字 = 自动判断闲聊或任务
-（危险任务会先要求 /确认；本机看板 http://127.0.0.1:3099/）"""
+
+进阶：/详情 /取消 <ID> /清空 /确认 /日志 /全文 /cd /心跳 /model /cost
+（危险操作会先要求 /确认；看板 http://127.0.0.1:3099/）"""
 
 
 def _fmt_ms(ms):
@@ -1577,12 +1649,56 @@ async def handle_command(text: str) -> bool:
                        f"内容 {m.get('text')}")
         return True
 
-    if low in ("/记忆", "/memory"):
-        mem = memory.load(MEMORY_PATH)
-        if mem:
-            await send("🧠 我还记得这些：\n" + mem)
+    if low in ("/规则", "/rules"):
+        if not RULES.rules:
+            await send("还没有学到的行为规则。\n"
+                       "纠正我一句（「下次别…」）就会自动记下来。")
         else:
-            await send("还没有特别的记忆。发 /记住 <内容> 添加。")
+            lines = []
+            for i, r in enumerate(RULES.rules, 1):
+                kind = rules.RULE_KINDS.get(r.get("kind"), r.get("kind"))
+                hits = r.get("hits", 0)
+                lines.append(f"{i}. {kind}｜{r.get('value')}（命中 {hits}）")
+            await send(f"📐 学到的规则（{len(RULES.rules)} 条）：\n" + "\n".join(lines)
+                       + "\n删除：/规则 删 <编号>　全部清空：/规则 清空")
+        return True
+
+    if low.startswith("/规则 删 ") or low.startswith("/规则 删除 "):
+        arg = t.split()[-1]
+        if arg.isdigit() and RULES.remove(int(arg)):
+            await send(f"🗑 已删除第 {arg} 条规则。")
+        else:
+            await send(f"没有第 {arg} 条规则，发 /规则 看编号。")
+        return True
+
+    if low == "/规则 清空":
+        n = RULES.clear()
+        await send(f"🗑 已清空 {n} 条规则。")
+        return True
+
+    if low in ("/记忆", "/memory"):
+        rows = memory.entries(MEMORY_PATH)
+        if rows:
+            # 带编号，方便用 /忘 <号> 或 /忘 <关键词> 删
+            body = "\n".join(f"{i + 1}. {r.lstrip('- ')}" for i, r in enumerate(rows))
+            await send(f"🧠 记得这些（共 {len(rows)} 条）：\n" + body
+                       + "\n删掉某条：/忘 <编号 或 关键词>")
+        else:
+            await send("还没有记忆。说「记住…」或发 /记住 <内容> 添加。")
+        return True
+
+    if low.startswith("/忘 ") or low.startswith("/forget "):
+        target = t.split(maxsplit=1)[1].strip()
+        rows = memory.entries(MEMORY_PATH)
+        # 先按编号删（/记忆 里显示的那个序号，从 1 开始）
+        if target.isdigit() and 1 <= int(target) <= len(rows):
+            target = rows[int(target) - 1]
+        n = memory.remove(MEMORY_PATH, target)
+        if n:
+            log(f"删除记忆：{target[:80]}")
+            await send(f"🗑 忘掉了：{target[:60]}")
+        else:
+            await send(f"没找到含「{target}」的记忆。发 /记忆 看有哪些。")
         return True
 
     if low.startswith("/记住 ") or low.startswith("/remember "):
@@ -1665,7 +1781,9 @@ async def handle_command(text: str) -> bool:
             await _run_confirmed(entry)
         return True
 
-    if low in ("/取消确认", "/取消", "/cancel", "/no"):
+    # 取消待确认的操作。**只认 /取消**（不带参数），
+    # `/取消 <ID>` 走下面那条分支去取消排队任务 —— 两者语义不同，别混。
+    if low in ("/取消", "/cancel", "/no", "/取消确认"):
         entry = PENDING_CONFIRM.get("entry")
         if entry:
             PENDING_CONFIRM["entry"] = None
@@ -1954,6 +2072,18 @@ async def on_message(data):
         return
 
     text = raw
+    # 引用回复：QQ 会在正文前塞一个 [CQ:reply,id=...]。不剥掉的话模型会把它
+    # 当成正文的一部分（实测它读成"带乱码的一句话"，完全没意识到那是在纠正
+    # 上一条回复），于是"下次别这么说"这类指令永远触发不了。
+    # 剥掉的同时记下"这是在对哪条说话"，用一句人话交给模型。
+    reply_to = ""
+    m_reply = re.search(r"\[CQ:reply,id=(-?\d+)\]", text)
+    if m_reply:
+        reply_to = m_reply.group(1)
+        text = re.sub(r"\[CQ:reply,[^\]]+\]", "", text)
+    # 顺带剥其余 CQ 码（@、表情、文件等），图片单独处理
+    text = re.sub(r"\[CQ:(?:at|face|mface|reply|json|xml|record|video|file),"
+                  r"[^\]]*\]", "", text).strip()
     imgs = await _save_images(data)
     # 有些 NapCat 配置把图片发成 CQ 码字符串（不是结构化分段），单独兜一层
     for m in re.finditer(r"\[CQ:image,([^\]]+)\]", text):
@@ -2004,6 +2134,21 @@ async def on_message(data):
     else:
         kind, why = classify(text, has_images=bool(imgs))
     log(f"分流：{kind}（{why}）")
+
+    # 引用回复：明确告诉模型"这句是对我上一条说的"，而不是让它从乱码里猜。
+    # 这是"通过聊天调试行为"能被听懂的前提。
+    if reply_to and kind == "chat":
+        text = ("（用户在引用我上一条消息说话——多半是在纠正或补充。"
+                "把这句当成针对我刚才那条回复的意见。）\n" + text)
+
+    # ---- 从这句话里学习 ----
+    # B 类：能机械判定的形式规则（下次别这么说 → 真的不这么说）
+    # A 类：说不清的偏好（写进 memory，靠提示词，模型自己把握）
+    if kind == "chat":
+        reply_note = await _learn_from_message(text)
+        if reply_note:
+            # 极短回执，让"它听懂了吗"这件事可见。只在真的写入时才发。
+            await send(reply_note)
 
     # message_id 做幂等键：NapCat 重连后可能重投同一条消息
     mid = data.get("message_id")

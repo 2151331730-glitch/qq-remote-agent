@@ -45,3 +45,6 @@ HANDOFF.md
 使用说明.md
 tests/tmp/
 bridge/*.bak*
+
+# 从聊天学到的行为规则（个人偏好，不入库）
+bridge/rules.json
