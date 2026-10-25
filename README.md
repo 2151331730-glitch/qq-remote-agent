@@ -3,6 +3,10 @@
 用手机 QQ 遥控一台 Windows 机器：发一条消息，本机的 `claude` CLI 执行任务，结果分段发回 QQ。
 还会区分「要动手」和「只是聊天」——闲聊有独立通道，顺带把单次成本压到 **1/200**。
 
+> 语音转写、任务瘦身、表情段、连发合并这四项的实测结论参考了
+> [wangpx2006/qq-agent-plugins](https://github.com/wangpx2006/qq-agent-plugins)（MIT），
+> 详见文末「参考与致谢」。
+
 ```
 手机 QQ ──私聊──▶ NapCat（注入 QQ NT，OneBot11 WS）
                         │ 127.0.0.1:3001
@@ -105,6 +109,10 @@ LLM API 五层，任何一层都可能断。所以整条链路是按「**假设�
 | Redis 单点挂了队列就停 | 主从 + 三哨兵：**4.6 秒选主、5.6 秒恢复写入**，数据完整 |
 | agent 任务仍在本体全权限跑 | `agent_sandbox: "wsl"`：提示词写文件、`wsl -e bash -lc` 调起（需 WSL 内装 Linux 版 CLI） |
 | 不知道跑久了会不会漏内存 | 10 分钟常压：内存 40→47MB 后平稳、队列不堆积、零失败（`docs/benchmarks.md` §6） |
+| 每个任务都在为用不到的 MCP 和工具定义付 token | 任务默认走 `lean` 档：六个内置工具 + 空 MCP 配置；实测单次 32,470 → 18,542 输入 token（−43%），需要时 `/完整 <指令>` 临时全开 |
+| 手机上发语音等于没发 | QQ 语音先落地再交给本地 faster-whisper（离线，4 秒音频约 4 秒出字），失败静默退回「没转成文字」 |
+| 一句话拆成几次发，就回几次 | 连发合并：挂尾多等 6 秒、每多一条 +1 秒、上限 20 秒；命令与图片不参与合并 |
+| 机器人只会打字，不会发表情 | `bridge/stickers/` 放图，模型写 `@@表情:名字@@`，bridge 用 `sub_type=1` 发出去——QQ 里显示成表情而不是大图 |
 
 
 ## 快速开始
@@ -153,14 +161,16 @@ Prometheus 每 5 秒抓一次 `/metrics`；Grafana 用 provisioning 文件自动
 
 ```powershell
 pip install pytest
-python -m pytest tests -q          # 174 个单测
+python -m pytest tests -q          # 243 个单测
 python tests\mock_test5.py         # 端到端：假 OneBot 服务端 + 真桥
+python tests\mock_new_feats.py     # 端到端：连发合并 + 语音转写（真跑 whisper）
 ```
 
 覆盖面：任务状态机与幂等（store）、Redis 后端、危险命令识别（guard）、
 指标（metrics）、看板 API（panel）、提醒解析、聊天分流（intent）、
 上下文摘录、公开通道限流（policy）、拟人节奏与去书面化（humantype）、
-直连通道（direct：历史持久化、scope 隔离、失败回滚、SSE 解析）。
+直连通道（direct：历史持久化、scope 隔离、失败回滚、SSE 解析）、
+表情解析与表情库扫描（stickers）、语音客户端失败边界（voice）。
 
 端到端测试用 `QQ_REMOTE_CONFIG` / `QQ_REMOTE_STATE` / `QQ_REMOTE_DB` 指向临时文件，
 监听 3002 端口，不会碰正在运行的真机 3001。
@@ -252,9 +262,28 @@ WAL 已经够做幂等认领和崩溃恢复。Redis 后端保留了（`store_bac
 
 实测一条任务的 QQ 侧表现：先出现若干段文本增量，最后一条是 `✅ 完整结果 + 耗时/token 状态行`。
 
+## 参考与致谢
+
+部分能力的**实测结论与做法**来自 [wangpx2006/qq-agent-plugins](https://github.com/wangpx2006/qq-agent-plugins)
+（MIT 许可，JS 实现的一组 QQ-agent 插件）。本项目只取可迁移的经验，代码按 Python/asyncio
+的结构重写，没有搬它的架构（它没有队列/指标/看板，本项目这些是自有部分）：
+
+| 借来的东西 | 在本项目里的落点 |
+|---|---|
+| `claude -p` 固定开销实测（53,948 → 12,986），以及"限工具 + 空 MCP"的瘦身思路 | `bridge/bridge.py` 的 `task_profile=lean`：六工具 + `--strict-mcp-config`，实测 −43% |
+| 语音消息的识别链路与"失败静默退回"策略 | `bridge/asr_server.py`、`bridge/voice.py`（改为本地 faster-whisper 常驻） |
+| QQ 图片段靠 `sub_type` 区分图片(0)/表情(1) | `bridge/stickers.py`，模型写 `@@表情:名字@@` |
+| 连发消息合并的窗口思路 | `bridge.py` 的 `_merge_append/_merge_flush`（窗口参数按本机实测重调） |
+
+上游仓库：<https://github.com/wangpx2006/qq-agent-plugins>（MIT）。
+如果这些做法对你有用，请也给上游点个 star。
+
 ## 说明
 
 - 本项目是个人自用工具，文档里的路径按 `C:\Users\<user>\qq-remote` 组织。
+- 任务瘦身、语音转写、表情段 `sub_type`、连发合并这四件事的实测结论来自
+  [wangpx2006/qq-agent-plugins](https://github.com/wangpx2006/qq-agent-plugins)（MIT），
+  本项目按 Python/asyncio 的结构重写，不是直接搬代码。
 - 仓库内不含任何 token / QQ 号 / 密码；`bridge/config.json` 已在 `.gitignore` 中，
   首次使用请从 `bridge/config.example.json` 复制并填入自己的值。
 - NapCat 属于第三方项目，不在本仓库内（`napcat/` 已忽略），需自行下载。

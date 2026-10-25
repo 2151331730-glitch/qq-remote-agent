@@ -22,5 +22,18 @@ if ($power -match "0x00000000") { Write-Host "[OK] 插电时不会睡眠" } else
 $battery = (Get-CimInstance Win32_Battery).BatteryStatus
 if ($battery -eq 2) { Write-Host "[OK] 正在用交流电" } else { Write-Host "[!] 当前是电池供电，睡眠定时 3 分钟" -ForegroundColor Yellow }
 
+# 语音识别服务（127.0.0.1:18791）：起不来只是"语音转不了文字"，不影响打字
+try {
+    $asr = Invoke-RestMethod -Uri "http://127.0.0.1:18791/health" -TimeoutSec 3
+    if ($asr.loaded) { Write-Host "[OK] 语音识别服务就绪（模型 $($asr.model) 已加载）" }
+    else { Write-Host "[!] 语音识别服务在跑，模型还没加载完" -ForegroundColor Yellow }
+} catch {
+    Write-Host "[!] 语音识别服务没起 —— 发语音不会转文字，打字照常" -ForegroundColor Yellow
+}
+
+$stickers = @(Get-ChildItem "$Root\bridge\stickers" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -match '^\.(gif|png|jpe?g|webp)$' })
+if ($stickers.Count -gt 0) { Write-Host "[OK] 表情库 $($stickers.Count) 张" } else { Write-Host "[!] 表情库是空的 —— 想让它发表情，往 bridge\stickers 丢图" -ForegroundColor Yellow }
+
 Write-Host "`n=== 最近 6 行日志 ===" -ForegroundColor Cyan
 Get-Content "$Root\logs\bridge.log" -Tail 6 -Encoding UTF8 -ErrorAction SilentlyContinue

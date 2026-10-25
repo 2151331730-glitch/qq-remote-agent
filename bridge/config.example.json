@@ -57,5 +57,22 @@
   "public_bubble_max_chars": 140,
   "public_bubble_max_parts": 3,
   "public_bubble_delay": 0.7,
-  "rules_path": ""
+  "rules_path": "",
+  "task_profile": "lean",
+  "task_tools": "Bash,Read,Write,Edit,Glob,Grep",
+  "task_mcp_mode": "empty",
+  "task_max_turns": 60,
+  "owner_merge_ms": 3500,
+  "owner_merge_max_ms": 20000,
+  "owner_merge_max_lines": 6,
+  "sticker_dir": "",
+  "voice": {
+    "enabled": true,
+    "port": 18791,
+    "model": "small",
+    "language": "zh",
+    "timeout_seconds": 180,
+    "python": "",
+    "model_dir": ""
+  }
 }

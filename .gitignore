@@ -48,3 +48,9 @@ bridge/*.bak*
 
 # 从聊天学到的行为规则（个人偏好，不入库）
 bridge/rules.json
+
+# 语音模型（480MB，装机时用 get_asr_model.py 下）
+bridge/asr-models/
+# 表情素材是私人东西，只留说明
+bridge/stickers/*
+!bridge/stickers/README.md

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority    INTEGER NOT NULL DEFAULT 0,
     cwd         TEXT,
     kind        TEXT NOT NULL DEFAULT 'task',
+    profile     TEXT,
     attempts    INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL,
     started_at  REAL,
@@ -90,7 +91,10 @@ class TaskStore:
         for name, ddl in (("tokens_in", "ALTER TABLE tasks ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"),
                           ("tokens_out", "ALTER TABLE tasks ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0"),
                           ("error_kind", "ALTER TABLE tasks ADD COLUMN error_kind TEXT"),
-                          ("kind", "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'")):
+                          ("kind", "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'"),
+                          # profile：lean（默认，禁 MCP + 工具白名单）或 full（全量）。
+                          # 老任务为 NULL = 执行时按当前配置决定。
+                          ("profile", "ALTER TABLE tasks ADD COLUMN profile TEXT")):
             if name not in cols:
                 c.execute(ddl)
 
@@ -115,10 +119,11 @@ class TaskStore:
     # ---------- 写入 ----------
 
     def enqueue(self, text, source="qq", sender=None, dedup_key=None,
-                priority=0, cwd=None, kind="task"):
+                priority=0, cwd=None, kind="task", profile=None):
         """入队。dedup_key 重复时返回 (已有 task_id, True)。
 
         kind：task（要动手的活）或 chat（闲聊通道），只影响提示词与会话，不影响排队规则。
+        profile：lean / full，决定这个任务加载多少工具与 MCP；None = 执行时取配置默认。
         """
         now = time.time()
         tid = uuid.uuid4().hex[:12]
@@ -126,8 +131,9 @@ class TaskStore:
             try:
                 c.execute(
                     "INSERT INTO tasks(id, source, sender, dedup_key, text, state,"
-                    " priority, cwd, kind, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (tid, source, sender, dedup_key, text, "queued", priority, cwd, kind, now))
+                    " priority, cwd, kind, profile, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (tid, source, sender, dedup_key, text, "queued", priority, cwd, kind,
+                     profile, now))
             except sqlite3.IntegrityError:
                 row = c.execute("SELECT id FROM tasks WHERE dedup_key=?", (dedup_key,)).fetchone()
                 return (row["id"] if row else None), True

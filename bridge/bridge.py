@@ -38,6 +38,8 @@ import history
 import policy
 import chatstyle
 import humantype
+import voice as voice_mod
+import stickers as sticker_mod
 from direct import DirectChat
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
@@ -94,6 +96,64 @@ STREAM_TEXT = bool(CFG.get("stream_text", True))
 STREAM_TEXT_MIN = int(CFG.get("stream_text_min_chars", 80))
 STREAM_TEXT_INTERVAL = float(CFG.get("stream_text_interval", 1.5))
 MODEL = CFG.get("model") or ""
+# ---- 任务通道瘦身（照 wangpx2006/qq-agent-plugins 的实测数据抄的）----
+# 上游：https://github.com/wangpx2006/qq-agent-plugins（MIT）
+# claude.exe 的固定开销按层拆开实测：默认全量 53,948 → 禁 MCP 27,695 → 再限制内置工具 12,986。
+# 任务是要动手的活，留六个常用工具就够；MCP 里那些（deepwiki/context7/playwright…）
+# 说明书每次调用都按 token 收费，而绝大多数任务根本用不到。
+# 需要全量时：发 `/完整 <指令>`，或把 task_profile 改成 full。
+TASK_PROFILE = str(CFG.get("task_profile") or "lean").lower()
+TASK_TOOLS = str(CFG.get("task_tools") or "Bash,Read,Write,Edit,Glob,Grep")
+TASK_MCP_MODE = str(CFG.get("task_mcp_mode") or "empty").lower()   # empty | default
+TASK_MAX_TURNS = int(CFG.get("task_max_turns", 60))
+EMPTY_MCP_PATH = Path(CFG.get("empty_mcp_path") or (BASE / "tmp" / "empty-mcp.json"))
+# ---- 语音消息：QQ 语音 → 本地 faster-whisper → 文字 ----
+VOICE_CFG = dict(CFG.get("voice") or {})
+VOICE_ENABLED = bool(VOICE_CFG.get("enabled", True))
+VOICE = voice_mod.Voice(VOICE_CFG)
+# ---- 连发合并：主人一句话分几段发时，攒起来当一条处理 ----
+MERGE_BASE_MS = int(CFG.get("owner_merge_ms", 3500))
+MERGE_MAX_MS = int(CFG.get("owner_merge_max_ms", 20000))
+MERGE_MAX_LINES = int(CFG.get("owner_merge_max_lines", 6))
+# ---- 表情：模型输出 @@表情:名字@@ 时单独发一条「表情」而不是大图 ----
+STICKER_DIR = Path(CFG.get("sticker_dir") or (BASE / "stickers"))
+STICKERS = sticker_mod.StickerBook(STICKER_DIR)
+
+
+async def send_sticker(name: str, target_type: str = "private", target_id: int = 0) -> bool:
+    """发一张表情。失败只记日志：文字已经发出去了，不该因为表情失败算整轮失败。"""
+    path = STICKERS.path_for(name)
+    if not path or CLIENT is None:
+        log(f"表情没发出去（找不到或没连接）：{name}")
+        return False
+    try:
+        if target_type == "group":
+            await CLIENT.call("send_group_msg",
+                              {"group_id": target_id, "message": [sticker_mod.segment(path)]})
+        else:
+            await CLIENT.call("send_private_msg",
+                              {"user_id": target_id or STATE["owner_uin"],
+                               "message": [sticker_mod.segment(path)]})
+        log(f"发了一张表情：{name}")
+        return True
+    except Exception as e:
+        logger.warning("表情发送失败：%s", e)
+        return False
+
+
+def ensure_empty_mcp() -> str:
+    """写一份空 MCP 配置。--strict-mcp-config 指过去 = 一个 MCP 都不加载。
+
+    建不出来就返回空串，调用方退回全量 —— 宁可贵一点，不能让任务跑不起来。
+    """
+    try:
+        EMPTY_MCP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not EMPTY_MCP_PATH.exists():
+            EMPTY_MCP_PATH.write_text('{"mcpServers":{}}', encoding="utf-8")
+        return str(EMPTY_MCP_PATH)
+    except Exception as e:
+        logger.warning("空 MCP 配置写不出来：%s", e)
+        return ""
 # 直连通道：闲聊不走 claude.exe，直接 POST /v1/messages。
 # claude.exe 每次调用固定 1.1~3 万输入 token（工具定义 + MCP + 系统提示），
 # 而闲聊的上下文上限才 3 万 —— 等于每句话都在换会话、每句话都在付壳的钱。
@@ -357,6 +417,11 @@ def reload_config() -> dict:
     g["CHAT_SLOW_NOTE_SEC"] = int(CFG.get("chat_slow_note_seconds", 45))
     g["SHOW_FOOTER"] = bool(CFG.get("show_footer", False))
     g["MODEL"] = CFG.get("model") or ""
+    g["TASK_PROFILE"] = str(CFG.get("task_profile") or "lean").lower()
+    g["TASK_TOOLS"] = str(CFG.get("task_tools") or "Bash,Read,Write,Edit,Glob,Grep")
+    g["TASK_MCP_MODE"] = str(CFG.get("task_mcp_mode") or "empty").lower()
+    g["TASK_MAX_TURNS"] = int(CFG.get("task_max_turns", 60))
+    g["VOICE_ENABLED"] = bool((CFG.get("voice") or {}).get("enabled", True))
     g["CHAT_TEMPLATE"] = str(CFG.get("chat_prompt_template") or "")
     g["TASK_TEMPLATE"] = str(
         CFG.get("task_prompt_template") or CFG.get("prompt_template")
@@ -593,7 +658,7 @@ def _describe_tool(block) -> str:
 
 
 def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: bool,
-                    session: str = ""):
+                    session: str = "", lean: bool = False, lean_mcp: str = ""):
     """把 agent 命令包进 WSL 执行。
 
     三个坑（都实测踩过）：
@@ -621,6 +686,13 @@ def _wsl_agent_argv(prompt: str, cwd: str, fmt: str, task_id: str, use_resume: b
         cmd += " --add-dir " + shlex.quote(sandbox._win_to_wsl(cwd))
     if use_resume and session:
         cmd += " --resume " + shlex.quote(session)
+    if lean:
+        cmd += " --max-turns " + shlex.quote(str(TASK_MAX_TURNS))
+        cmd += " --tools " + shlex.quote(TASK_TOOLS)
+        if lean_mcp:
+            # WSL 里跑的是 Linux 版 CLI，配置路径要用 WSL 侧的写法
+            cmd += (" --strict-mcp-config --mcp-config "
+                    + shlex.quote(sandbox._win_to_wsl(lean_mcp)))
 
     # `~` 放在双引号里不会展开，统一换成 $HOME
     _exp = lambda s: s.replace("~", "$HOME", 1) if s.startswith("~") else s  # noqa: E731
@@ -657,7 +729,7 @@ def check_agent_sandbox() -> bool:
 
 
 async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_text=None,
-                     kind: str = "task", scope: str = ""):
+                     kind: str = "task", scope: str = "", profile: str | None = None):
     """跑一次 claude -p。
 
     kind 决定续接哪个会话（task / chat / public），各通道互不影响。
@@ -672,6 +744,9 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
     # 公开聊天有独立信号量串行，所以可以安全地续接各自会话
     use_session = True if is_public else WORKERS == 1
     session = get_session(kind, scope)
+    # lean = 禁 MCP + 只留白名单工具。full = 一切照旧（需要浏览 MCP 时用 /完整）
+    lean = kind == "task" and (str(profile or TASK_PROFILE).lower() != "full")
+    lean_mcp = ensure_empty_mcp() if (lean and TASK_MCP_MODE == "empty") else ""
 
     async def _once(use_resume: bool):
         # claude_cmd（列表）用于压测/包装：默认是 claude.exe 原生二进制
@@ -688,7 +763,8 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                 args += ["--resume", session]
         elif AGENT_SANDBOX == "wsl":
             args = _wsl_agent_argv(prompt, cwd, fmt, task_id, use_resume and use_session,
-                                   session if use_session else "")
+                                   session if use_session else "",
+                                   lean=lean, lean_mcp=lean_mcp)
         else:
             args = base + ["-p", prompt, "--output-format", fmt,
                            "--dangerously-skip-permissions"]
@@ -698,6 +774,10 @@ async def run_claude(prompt: str, task_id: str, cwd: str, on_progress=None, on_t
                     args.append("--include-partial-messages")
             if MODEL:
                 args += ["--model", MODEL]
+            if lean:
+                args += ["--max-turns", str(TASK_MAX_TURNS), "--tools", TASK_TOOLS]
+                if lean_mcp:
+                    args += ["--strict-mcp-config", "--mcp-config", lean_mcp]
             # 闲聊兜底预算：一句话触发的工具链不该烧掉一整个任务的钱
             if kind == "chat" and CHAT_MAX_BUDGET > 0:
                 args += ["--max-budget-usd", f"{CHAT_MAX_BUDGET:.2f}"]
@@ -1038,6 +1118,20 @@ def _direct_system() -> str:
     if mem:
         parts.append("（你记得的关于主人的事，自然用上，别逐条复述：\n" + mem + "）")
     parts.append(CHAT_STYLE_RULE)
+    # 有表情库才教它用；库里是空的就别提，免得它写一个发不出去的标记。
+    # 每次说话前重扫一遍目录：往 stickers\ 里丢一张图就能立刻用，不用重启。
+    try:
+        STICKERS.scan()
+    except Exception:
+        pass
+    menu = STICKERS.menu() if len(STICKERS) else ""
+    if menu:
+        parts.append(
+            "（你手里有这些 QQ 表情，格式是 名字=它的样子：" + menu + "\n"
+            "想发表情就在回复最后单独一行写 @@表情:名字@@，系统会把它摘掉、单独发一张。\n"
+            "一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，"
+            "跟人发微信一个样。别同一个连着用。"
+            "表情经常比文字更贴，只有一两句话的时候尤其适合。）")
     parts.append(ESCALATE_RULE)
     return "\n\n".join(p for p in parts if p)
 
@@ -1131,6 +1225,8 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
         return await _execute_claude_chat(row, WORKDIR)
 
     body = _plain(reply)
+    # 表情标记先摘出来：剩下的文字长度、去标点、学规则都按干净文本算
+    body, sticker_name = sticker_mod.extract(body)
     STORE.finish(tid, "succeeded", result=body, exit_code=0, cost_usd=0.0,
                  duration_ms=int(seconds * 1000), tokens_in=tin, tokens_out=tout)
     METRICS.inc("qq_remote_tasks_total", {"state": "succeeded"})
@@ -1151,6 +1247,10 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
         await _deliver_human(speak, tid)
         if from_qq:
             _record("owner", int(CFG.get("bot_uin") or 0), "我", speak)
+    if sticker_name:
+        # 先说话再贴表情，跟真人顺序一致；表情没有文字也算回了话（不触发「没说出话来」）
+        await asyncio.sleep(random.uniform(0.4, 1.1))
+        await send_sticker(sticker_name)
     if followup:
         # 模型决定这事得动电脑：立刻转成一条任务，结果另发
         log(f"闲聊升级为任务：{followup[:120]}")
@@ -1160,7 +1260,7 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
                 await send("我看下")
         else:
             await send(f"想查一下但排不进去（{res.get('status')}），等会儿再问我。")
-    elif not speak:
+    elif not speak and not sticker_name:
         await _deliver_human("（没说出话来）", tid)
     _cleanup(tid)
 
@@ -1216,7 +1316,9 @@ async def _execute_claude_chat(row, cwd):
         prompt, tid, cwd,
         # 闲聊不转发工具进度：手机聊天里不该出现运维日志
         on_progress=None if kind == "chat" else _progress,
-        on_text=_text, kind=kind))
+        on_text=_text, kind=kind,
+        # 任务可以逐条指定 lean/full（/完整 前缀）；None 就走配置默认
+        profile=(row.get("profile") if hasattr(row, "get") else None)))
     RUNNING[tid] = {"task": run_task, "text": text, "started": started, "cwd": cwd,
                     "kind": kind}
 
@@ -1609,6 +1711,8 @@ HELP = """命令（只列常用的，其余见 /帮助 全部）：
 /提醒 20:30 交作业   到点提醒
 /提醒列表   看还没到点的
 /重载   改完 config.json 不用重启
+/完整 <事>   这条任务放开全部工具和 MCP（默认只有六个工具、不加载 MCP）
+发语音   直接说，本机转成文字（转不出来会说没听清）
 !<命令>   直接执行 PowerShell
 其他任何文字 = 自动判断闲聊或任务
 
@@ -1944,7 +2048,7 @@ async def _ask_confirm(kind, text, source, reason):
 
 
 async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender=None,
-                      cwd=None, kind="task"):
+                      cwd=None, kind="task", profile=None):
     """入队一个 agent 任务；危险任务先要求确认。cwd 指定后可按目录并行。
 
     kind="chat" 是闲聊通道：同样的执行器，但用闲聊提示词与会话，回复不带任务后缀。
@@ -1964,7 +2068,8 @@ async def submit_task(text, source="qq", confirmed=False, dedup_key=None, sender
     if reason and not confirmed:
         return await _ask_confirm("task", text, source, reason)
     tid, dup = STORE.enqueue(text, source=source, sender=sender, dedup_key=dedup_key,
-                             cwd=cwd or STATE.get("cwd") or WORKDIR, kind=kind)
+                             cwd=cwd or STATE.get("cwd") or WORKDIR, kind=kind,
+                             profile=profile)
     if dup:
         log(f"重复投递，忽略：{dedup_key} -> {tid}")
         return {"status": "duplicate", "id": tid}
@@ -2070,6 +2175,222 @@ async def _save_images(data):
     return paths
 
 
+async def _voice_audio(seg: dict):
+    """把一个 record（语音）段变成音频字节。
+
+    三种来源依次试，全部失败返回 None：
+      ① 段里直接给了本地路径（NapCat 已缓存）→ 读文件
+      ② OneBot get_record（base64 或转成本地文件）→ 解出来
+      ③ 段里的 url 直链 → 下载
+
+    为什么不用 QQ 自带的语音转文字：这套协议端上 OneBot 的 message_id 是哈希合成的，
+    不是 QQ 真实 msgId，服务端拿它查不到这条语音，请求发出即被拒。但音频文件本身拿得到。
+    """
+    import base64
+    import urllib.request
+    d = seg.get("data") or {}
+    for key in ("path", "file"):
+        p = str(d.get(key) or "")
+        if p and os.path.isfile(p):
+            try:
+                return Path(p).read_bytes()
+            except Exception as e:
+                logger.warning("语音本地文件读失败：%s", e)
+    fname = str(d.get("file") or "")
+    if fname and CLIENT is not None:
+        try:
+            r = await CLIENT.call("get_record", {"file": fname, "out_format": "wav"}, 30)
+            payload = r.get("data") or {}
+            b64 = payload.get("base64") or (payload.get("data") or {}).get("base64") or ""
+            if b64:
+                return base64.b64decode(b64)
+            fp = str(payload.get("file") or payload.get("path") or "")
+            if fp and os.path.isfile(fp):
+                return Path(fp).read_bytes()
+        except Exception as e:
+            logger.warning("get_record 失败，试直链：%s", e)
+    url = str(d.get("url") or d.get("file_url") or "")
+    if url.startswith("http"):
+        try:
+            def _dl(u=url):
+                with urllib.request.urlopen(u, timeout=20) as r:
+                    return r.read()
+            return await asyncio.to_thread(_dl)
+        except Exception as e:
+            logger.warning("语音直链下载失败：%s", e)
+    return None
+
+
+async def _transcribe_segments(segs) -> list[str]:
+    """把消息里的语音段转成文字（列表）。失败的那条不进列表，由调用方给占位提示。"""
+    if not VOICE_ENABLED or not isinstance(segs, list):
+        return []
+    out = []
+    for seg in segs:
+        if not isinstance(seg, dict) or seg.get("type") != "record":
+            continue
+        audio = await _voice_audio(seg)
+        if not audio:
+            continue
+        text = await asyncio.to_thread(VOICE.transcribe, audio)
+        if text:
+            out.append(text)
+            log(f"语音转文字：{text[:80]}")
+    return out
+
+
+# ---- 连发合并（debounce）----
+# 手机上一句话常被拆成几次发（"你帮我看看" / "那个项目" / "是不是挂了啊"）。
+# 每条都当一次输入，就会连着回好几轮、还接不上自己前面的话。
+# 所以攒一会儿再处理。等待时长不是固定的：
+#   · 最后一句挂着「而且/然后/但是/，」→ 明显没说完，多等 6 秒；
+#   · 每多攒一条就多给 1 秒耐心（说明他还在打字）；
+#   · 但从第一条算起最多等 owner_merge_max_ms，没完没了地发也不能一直不回。
+MERGE = {"lines": [], "data": None, "uid": 0, "reply_to": "", "started": 0.0, "task": None}
+MERGE_LOCK = asyncio.Lock()
+HANGING_RE = re.compile(r"(而且|还有|然后|就是|因为|所以|但是|不过|另外|其实|如果|要是|以及|[，,、])$")
+
+
+def _merge_delay() -> float:
+    n = len(MERGE["lines"])
+    last = str(MERGE["lines"][-1] if MERGE["lines"] else "").strip()
+    hang = 6000 if HANGING_RE.search(last) else 0
+    patience = min(MERGE_BASE_MS + hang + max(0, n - 1) * 1000, MERGE_MAX_MS)
+    elapsed_ms = (time.time() - MERGE["started"]) * 1000 if MERGE["started"] else 0
+    return max(800, min(patience, MERGE_MAX_MS - elapsed_ms)) / 1000
+
+
+async def _merge_flush_later(delay: float):
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    await _merge_flush()
+
+
+async def _merge_flush():
+    """把攒着的几句拼成一条，交给 _handle_owner_text。"""
+    async with MERGE_LOCK:
+        if not MERGE["lines"]:
+            return
+        merged = "\n".join(MERGE["lines"])
+        data, uid, reply_to = MERGE["data"], MERGE["uid"], MERGE["reply_to"]
+        MERGE.update(lines=[], data=None, uid=0, reply_to="", started=0.0)
+        t = MERGE["task"]
+        if t and t is not asyncio.current_task():
+            t.cancel()
+        MERGE["task"] = None
+    if not data:
+        return
+    if "\n" in merged:
+        log(f"合并 {merged.count(chr(10)) + 1} 条连发")
+    await _handle_owner_text(merged, data, uid, has_images=False, reply_to=reply_to)
+
+
+async def _merge_append(text: str, data, uid: int, has_images: bool = False, reply_to: str = ""):
+    """主人私聊的入口。命令 / shell / 图片不参与合并，先把攒好的发出去再立刻处理。"""
+    instant = text.startswith(("/", "!")) or has_images
+    if instant:
+        await _merge_flush()
+        await _handle_owner_text(text, data, uid, has_images=has_images, reply_to=reply_to)
+        return
+    flush_now = False
+    delay = 0.0
+    async with MERGE_LOCK:
+        if not MERGE["lines"]:
+            MERGE["started"] = time.time()
+            MERGE["data"] = data
+            MERGE["uid"] = uid
+        MERGE["lines"].append(text)
+        MERGE["reply_to"] = MERGE["reply_to"] or reply_to
+        if len(MERGE["lines"]) >= MERGE_MAX_LINES:
+            flush_now = True
+        else:
+            delay = _merge_delay()
+            t = MERGE["task"]
+            if t:
+                t.cancel()
+            MERGE["task"] = asyncio.create_task(_merge_flush_later(delay))
+    if flush_now:
+        await _merge_flush()
+
+
+async def _handle_owner_text(text: str, data, uid: int, has_images: bool = False,
+                             reply_to: str = ""):
+    """主人私聊的正文处理：命令 → 分流 → 入队。原来 on_message 的后半段。"""
+    log(f"收到：{text[:300]}")
+    # 主人私聊也留一份本地记录，重启/换会话后能靠它接上
+    _record("owner", uid, "主人", re.sub(r"\[CQ:[^\]]+\]", "",
+                                         str(data.get("raw_message") or text)))
+    if text.startswith("!"):
+        await submit_shell(text, "qq")
+        return
+    if await handle_command(text):
+        return
+
+    # 显式指定通道：/执行 强制当任务，/聊 强制当闲聊
+    force = None
+    profile = None
+    low = text.lower()
+    # 只认 /完整：别再叫 /full，它和 /全文 太像，容易按错命令
+    if low.startswith("/完整 "):
+        # 临时放开全部工具与 MCP（默认任务只有六个工具、不加载 MCP）
+        text = text.split(maxsplit=1)[1].strip()
+        profile = "full"
+    if low.startswith("/执行 ") or low.startswith("/do ") or low.startswith("/task "):
+        text = text.split(maxsplit=1)[1].strip()
+        force = "task"
+    elif low.startswith("/聊 ") or low.startswith("/chat "):
+        text = text.split(maxsplit=1)[1].strip()
+        force = "chat"
+    if not text:
+        await send("用法：/执行 <要做的事> 或 /聊 <想说的话>")
+        return
+    if force:
+        kind, why = force, "用户指定"
+    elif profile == "full":
+        kind, why = "task", "完整工具集"
+    else:
+        kind, why = classify(text, has_images=has_images)
+    log(f"分流：{kind}（{why}）")
+
+    # 引用回复：明确告诉模型"这句是对我上一条说的"，而不是让它从乱码里猜。
+    # 这是"通过聊天调试行为"能被听懂的前提。
+    if reply_to and kind == "chat":
+        text = ("（用户在引用我上一条消息说话——多半是在纠正或补充。"
+                "把这句当成针对我刚才那条回复的意见。）\n" + text)
+
+    # ---- 从这句话里学习 ----
+    # B 类：能机械判定的形式规则（下次别这么说 → 真的不这么说）
+    # A 类：说不清的偏好（写进 memory，靠提示词，模型自己把握）
+    if kind == "chat":
+        reply_note = await _learn_from_message(text)
+        if reply_note:
+            # 极短回执，让"它听懂了吗"这件事可见。只在真的写入时才发。
+            await send(reply_note)
+
+    # message_id 做幂等键：NapCat 重连后可能重投同一条消息
+    mid = data.get("message_id")
+    dedup = f"qq:{mid}" if mid is not None else None
+    res = await submit_task(text, "qq", dedup_key=dedup, sender=str(uid), kind=kind,
+                            profile=profile)
+    status = res.get("status")
+    if status == "queued":
+        if kind == "chat":
+            # 闲聊不确认、不排队提示，直接等回答（像发微信）
+            return
+        if res["pos"] > 1:
+            await send(f"📥 前面还有 {res['pos'] - 1} 个活，弄完就轮到你这个（任务 {res['id']}）")
+        else:
+            await send(f"📥 好嘞，这就去弄（任务 {res['id']}）")
+    elif status == "duplicate":
+        log(f"忽略重复投递：{dedup}")
+    elif status == "full":
+        await send(f"📮 队列满了（{MAX_QUEUE} 个待执行），先等前面的跑完。")
+    elif status == "quota":
+        await send(f"🚦 {res.get('reason')}")
+
+
 async def on_message(data):
     if data.get("post_type") != "message":
         return
@@ -2102,12 +2423,31 @@ async def on_message(data):
     if m_reply:
         reply_to = m_reply.group(1)
         text = re.sub(r"\[CQ:reply,[^\]]+\]", "", text)
+    # 语音：先把音频拿下来转成文字（失败就只是没有文字，不打断流程）
+    _segs = data.get("message")
+    structured_record = (isinstance(_segs, list) and any(
+        isinstance(s, dict) and s.get("type") == "record" for s in _segs))
+    voice_lines = await _transcribe_segments(_segs)
+    # 有些 NapCat 配置把语音发成 CQ 码字符串（不是结构化分段），单独兜一层。
+    # ⚠️ 只在结构化分段里没有语音时才走这条路：raw_message 里同样带 CQ 码，
+    #    两条路都跑会把同一句语音转两遍、重复拼进正文（实测踩过）。
+    for m in ([] if structured_record else re.finditer(r"\[CQ:record,([^\]]+)\]", text)):
+        kv = dict(x.split("=", 1) for x in m.group(1).split(",") if "=" in x)
+        audio = await _voice_audio({"data": kv})
+        got = await asyncio.to_thread(VOICE.transcribe, audio) if audio else None
+        if got:
+            voice_lines.append(got)
+            log(f"语音转文字（CQ 形式）：{got[:80]}")
+    had_voice = bool(voice_lines) or structured_record or bool(re.search(r"\[CQ:record,", text))
     # 顺带剥其余 CQ 码（@、表情、文件等），图片单独处理
     text = re.sub(r"\[CQ:(?:at|face|mface|reply|json|xml|record|video|file),"
                   r"[^\]]*\]", "", text).strip()
     imgs = await _save_images(data)
-    # 有些 NapCat 配置把图片发成 CQ 码字符串（不是结构化分段），单独兜一层
-    for m in re.finditer(r"\[CQ:image,([^\]]+)\]", text):
+    # 有些 NapCat 配置把图片发成 CQ 码字符串（不是结构化分段），单独兜一层。
+    # 同样只在结构化分段里没有图时才走：否则同一张图会被下载两次、在提示词里出现两遍。
+    structured_img = (isinstance(_segs, list) and any(
+        isinstance(s, dict) and s.get("type") == "image" for s in _segs))
+    for m in ([] if structured_img else re.finditer(r"\[CQ:image,([^\]]+)\]", text)):
         kv = dict(x.split("=", 1) for x in m.group(1).split(",") if "=" in x)
         url = (kv.get("url") or kv.get("file") or "").replace("&amp;", "&")
         if url:
@@ -2126,70 +2466,18 @@ async def on_message(data):
     if imgs:
         note = "（主人发来的图片，请先用 Read 工具查看：" + "；".join(imgs) + "）"
         text = (text + chr(10) * 2 + note) if text else note
+    # 语音转出来的话就当成他说的话：带标记，模型才知道这不是打字
+    if voice_lines:
+        spoken = "\n".join(f"[语音转文字] {v}" for v in voice_lines)
+        text = (spoken + ("\n" + text if text else "")).strip()
+    elif had_voice and not text:
+        # 转不出来时给个明确的占位，别让模型以为对方发了空白消息
+        text = "[语音，没能转成文字]"
     if not text:
         return
 
-    log(f"收到：{text[:300]}")
-    # 主人私聊也留一份本地记录，重启/换会话后能靠它接上
-    _record("owner", uid, "主人", re.sub(r"\[CQ:[^\]]+\]", "", raw))
-    if text.startswith("!"):
-        await submit_shell(text, "qq")
-        return
-    if await handle_command(text):
-        return
-
-    # 显式指定通道：/执行 强制当任务，/聊 强制当闲聊
-    force = None
-    low = text.lower()
-    if low.startswith("/执行 ") or low.startswith("/do ") or low.startswith("/task "):
-        text = text.split(maxsplit=1)[1].strip()
-        force = "task"
-    elif low.startswith("/聊 ") or low.startswith("/chat "):
-        text = text.split(maxsplit=1)[1].strip()
-        force = "chat"
-    if not text:
-        await send("用法：/执行 <要做的事> 或 /聊 <想说的话>")
-        return
-    if force:
-        kind, why = force, "用户指定"
-    else:
-        kind, why = classify(text, has_images=bool(imgs))
-    log(f"分流：{kind}（{why}）")
-
-    # 引用回复：明确告诉模型"这句是对我上一条说的"，而不是让它从乱码里猜。
-    # 这是"通过聊天调试行为"能被听懂的前提。
-    if reply_to and kind == "chat":
-        text = ("（用户在引用我上一条消息说话——多半是在纠正或补充。"
-                "把这句当成针对我刚才那条回复的意见。）\n" + text)
-
-    # ---- 从这句话里学习 ----
-    # B 类：能机械判定的形式规则（下次别这么说 → 真的不这么说）
-    # A 类：说不清的偏好（写进 memory，靠提示词，模型自己把握）
-    if kind == "chat":
-        reply_note = await _learn_from_message(text)
-        if reply_note:
-            # 极短回执，让"它听懂了吗"这件事可见。只在真的写入时才发。
-            await send(reply_note)
-
-    # message_id 做幂等键：NapCat 重连后可能重投同一条消息
-    mid = data.get("message_id")
-    dedup = f"qq:{mid}" if mid is not None else None
-    res = await submit_task(text, "qq", dedup_key=dedup, sender=str(uid), kind=kind)
-    status = res.get("status")
-    if status == "queued":
-        if kind == "chat":
-            # 闲聊不确认、不排队提示，直接等回答（像发微信）
-            return
-        if res["pos"] > 1:
-            await send(f"📥 前面还有 {res['pos'] - 1} 个活，弄完就轮到你这个（任务 {res['id']}）")
-        else:
-            await send(f"📥 好嘞，这就去弄（任务 {res['id']}）")
-    elif status == "duplicate":
-        log(f"忽略重复投递：{dedup}")
-    elif status == "full":
-        await send(f"📮 队列满了（{MAX_QUEUE} 个待执行），先等前面的跑完。")
-    elif status == "quota":
-        await send(f"🚦 {res.get('reason')}")
+    # 连发的几句话先攒成一条再处理（攒法见 _merge_append）
+    await _merge_append(text, data, uid, has_images=bool(imgs), reply_to=reply_to)
 
 
 SEEN_FLAGS = {}
@@ -2374,6 +2662,13 @@ async def main():
         asyncio.create_task(worker(i))
     asyncio.create_task(janitor())
     asyncio.create_task(reminder_loop())
+    # 语音识别服务提前拉起来：模型加载/首次下载都要时间，等第一条语音再起就太晚了
+    if VOICE_ENABLED:
+        asyncio.create_task(asyncio.to_thread(VOICE.ensure_server))
+        log("语音识别：后台预热中（首次会下载模型，约 480MB，走 hf-mirror）")
+    log(f"任务通道：profile={TASK_PROFILE} 工具={TASK_TOOLS} "
+        f"MCP={TASK_MCP_MODE} max_turns={TASK_MAX_TURNS}；/完整 可临时放开")
+    log(f"表情库：{len(STICKERS)} 张（{STICKER_DIR}）")
     try:
         _pending_reminders = len(RSTORE.pending())
         if _pending_reminders:

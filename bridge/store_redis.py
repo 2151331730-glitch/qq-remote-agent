@@ -129,7 +129,7 @@ class RedisStore:
     # ---------- 写入 ----------
 
     def enqueue(self, text, source="qq", sender=None, dedup_key=None,
-                priority=0, cwd=None, kind="task"):
+                priority=0, cwd=None, kind="task", profile=None):
         tid = uuid.uuid4().hex[:12]
         if dedup_key:
             if not self.r.hsetnx(self._k("dedup"), dedup_key, tid):
@@ -138,7 +138,7 @@ class RedisStore:
         task = {
             "id": tid, "source": source, "sender": sender, "dedup_key": dedup_key,
             "text": text, "state": "queued", "priority": priority, "cwd": cwd,
-            "kind": kind,
+            "kind": kind, "profile": profile,
             "attempts": 0, "created_at": now, "started_at": None, "finished_at": None,
             "duration_ms": None, "exit_code": None, "cost_usd": 0,
             "tokens_in": 0, "tokens_out": 0, "result": None, "error": None,
