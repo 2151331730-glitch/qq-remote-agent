@@ -26,7 +26,7 @@ jobs:
       - name: 语法检查
         env:
           PYTHONUTF8: "1"
-        run: python -m py_compile bridge/bridge.py bridge/store.py bridge/store_redis.py bridge/metrics.py bridge/panel.py bridge/guard.py bridge/sandbox.py
+        run: python -m py_compile bridge/bridge.py bridge/direct.py bridge/humantype.py bridge/chatstyle.py bridge/store.py bridge/store_redis.py bridge/metrics.py bridge/panel.py bridge/guard.py bridge/sandbox.py bridge/history.py bridge/intent.py bridge/policy.py
 
   e2e:
     name: 端到端（假 OneBot + 真桥 + 假 CLI）
