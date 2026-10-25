@@ -30,11 +30,18 @@ _QUESTION = re.compile(
     r"[?？]|吗|呢|为什么|是什么|什么意思|怎么(用|办|样|回事)|如何|能不能|可不可以|"
     r"是不是|要不要|哪个|哪些|你觉得")
 
+# 「问概念」而不是「问状态」：这类疑问是在问"什么意思/为什么/怎么办"，
+# 不需要看电脑，凭知识就能答。判在 _NOUN 之前，避免「这个报错是什么意思」
+# 因为提到"报错"就被当成要去查日志。
+_CONCEPT_Q = re.compile(
+    r"是什么(意思|原理|东西)|什么意思|为什么(会|要|是)|啥意思|"
+    r"怎么(用|理解|办)|如何(理解|使用)|原理|区别|哪个好|该学|建议")
+
 # 电脑上的东西，提到就大概率是任务
 _NOUN = re.compile(
     r"文件|文件夹|目录|路径|桌面|代码|项目|仓库|程序|进程|端口|命令|脚本|日志|配置|"
-    r"数据库|报错|环境变量|\bgit\b|\bnpm\b|\bpip\b|\bpython\b|powershell|\bcmd\b|"
-    r"\bdocker\b|\bwsl\b|\bapi\b|\bpytest\b", re.I)
+    r"数据库|报错|环境变量|\bgit\b|\bgithub\b|\bnpm\b|\bpip\b|\bpython\b|powershell|\bcmd\b|"
+    r"\bdocker\b|\bwsl\b|\bapi\b|\bpytest\b|\bcommit\b|\bpush\b", re.I)
 
 # 英文命令打头（"git status" / "npm run dev"），排除了纯提问的情况
 _EN_CMD = re.compile(
@@ -45,7 +52,17 @@ LONG_TEXT = 160
 
 
 def classify(text: str, has_images: bool = False):
-    """返回 (kind, reason)；kind 为 "chat" 或 "task"。"""
+    """返回 (kind, reason)；kind 为 "chat" 或 "task"。
+
+    **顺序很重要**：疑问句要先判，再判任务动词。
+
+    真实踩过的坑：「收到开始执行这句话能不能口语化」——
+    它是在讨论说话风格，但"执行"命中了任务动词，被当成工单跑了 4 分钟。
+    用户看到的是"我问个问题，它闷头干活"。
+
+    例外：问句里明确点到电脑上的东西（文件/路径/进程/仓库…），仍然算任务，
+    因为"这个文件改了吗"确实需要去查。
+    """
     t = (text or "").strip()
     if not t:
         return "chat", "空消息"
@@ -53,12 +70,19 @@ def classify(text: str, has_images: bool = False):
         return "task", "带图片"
     if "```" in t:
         return "task", "含代码块"
+
+    # 问概念（"这是什么意思/为什么"）：凭知识能答，不需要看电脑
+    if _CONCEPT_Q.search(t) and not _PATH.search(t):
+        return "chat", "问概念"
+
+    # 疑问句优先：除非同时提到了电脑上的具体对象
+    if _QUESTION.search(t) and not _PATH.search(t) and not _NOUN.search(t):
+        return "chat", "疑问句"
+
     if _VERB.search(t):
         return "task", "任务动词"
     if _PATH.search(t):
         return "task", "路径"
-    if _QUESTION.search(t):
-        return "chat", "疑问句"
     if _EN_CMD.search(t):
         return "task", "命令打头"
     if _NOUN.search(t):

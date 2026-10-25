@@ -980,6 +980,11 @@ async def _deliver_human(body: str, tid: str) -> bool:
     2. `split_like_human()` —— 真人 84% 只发一条，默认就不拆
     3. `compose_timeline()` —— 首条 1.5~4 秒，不秒回
     """
+    # 内部状态泄漏（"任务完成，没有文字输出"）绝不发给用户 —— 那是程序语言
+    if humantype.looks_like_leak(body):
+        log(f"拦下内部状态输出：{body[:40]}")
+        body = ""
+
     text = humantype.humanize(body) or body
     # 学到的行为规则在这里生效：**发出前**用代码检查一遍，不靠模型自觉。
     # 这是「下次别这么说」真的管用的关键。
@@ -1049,7 +1054,12 @@ CHAT_STYLE_RULE = (
     "· 不用 Markdown：标题、表格、列表、代码块、加粗一律不要\n"
     "· 不要总结对方刚说的话，不要「首先其次最后」，不要客服腔"
     "（「好的」「希望对你有帮助」「还有什么可以帮您」）\n"
-    "· 不要每句都带 emoji）")
+    "· 不要每句都带 emoji\n"
+    "· **别拿「行」「嗯」「好」当整条回复**。真人也会用它们开头，但后面一定接"
+    "实质内容——「行，那我闭嘴，等你放片头」是对的，「行 那就不说了」是敷衍\n"
+    "· **开场词不要重复**。连着几条都以「行」「嗯」「在呢」开头，一眼就看出来是机器\n"
+    "· 不要为了显得有回应而硬答一句；没什么可说的就说不知道，或者反问一句\n"
+    "· 绝不能说「任务完成」「没有文字输出」「没有回话」这种程序状态——那是日志）")
 
 
 # 轻通道里"要动电脑"的暗号：模型没法执行命令，但可以把要做的活交回重通道。
@@ -1095,6 +1105,17 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
     try:
         reply, ok = await asyncio.to_thread(
             DIRECT.ask, scope, text, _direct_system(), None)
+        # 敷衍检测：只回「行」「好的」这类没有信息量的应声，再要一次。
+        # 实测机器人反复用「行 那就不说了」收尾，而真人会接实质内容
+        # （「行，那我闭嘴，等你放片头」）。只重试一次，避免翻倍成本。
+        if ok and humantype.is_thin(reply):
+            log(f"回复太薄（{reply[:20]}），再要一句")
+            again, ok2 = await asyncio.to_thread(
+                DIRECT.ask, scope,
+                "（刚才那句太敷衍了。接着说一句实在的，不要只应一声）",
+                _direct_system(), None)
+            if ok2 and again and not humantype.is_thin(again):
+                reply = again
     except Exception as e:
         logger.exception("直连闲聊异常")
         DIRECT.last_error = f"{type(e).__name__}: {e}"
@@ -2160,9 +2181,9 @@ async def on_message(data):
             # 闲聊不确认、不排队提示，直接等回答（像发微信）
             return
         if res["pos"] > 1:
-            await send(f"📥 已收到，排在第 {res['pos']} 位。（任务 {res['id']}）")
+            await send(f"📥 前面还有 {res['pos'] - 1} 个活，弄完就轮到你这个（任务 {res['id']}）")
         else:
-            await send(f"📥 收到，开始执行。（任务 {res['id']}）")
+            await send(f"📥 好嘞，这就去弄（任务 {res['id']}）")
     elif status == "duplicate":
         log(f"忽略重复投递：{dedup}")
     elif status == "full":

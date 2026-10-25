@@ -6,6 +6,7 @@
 import datetime as dt
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -14,7 +15,9 @@ ROOT = Path(r"C:\Users\win11\qq-remote")
 LOG = ROOT / "logs" / "bridge.log"
 OUT = ROOT / "tools" / "restart-watcher.log"
 RESTART = ROOT / "restart-bridge.ps1"
-TASK_MARK = "任务开始：那就做"
+# 用法：python tools\apply-bridge-restart.py <任务号或文字片段>
+# 不传就退回旧默认，兼容以前的调用方式。
+TASK_MARK = sys.argv[1] if len(sys.argv) > 1 else "那就做"
 TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO ")
 
 DEADLINE = time.time() + 15 * 60
@@ -40,6 +43,7 @@ def task_finished():
     start = None
     for i, line in enumerate(lines):
         if TASK_MARK in line and "任务开始" in line:
+            # 只看这次跑的那条；任务号/文字片段由调用方给出
             start = i
     if start is None:
         return False

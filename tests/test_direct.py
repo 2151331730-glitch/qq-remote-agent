@@ -396,3 +396,40 @@ def test_direct_failure_falls_back_too(monkeypatch):
     # 直连内部回退时用 WORKDIR 作为工作目录（历史遗留行为，不是调用方的 cwd）。
     # 这条测试只保证"确实回退了、没有再卡在直连里"。
     assert len(calls) == 1
+
+
+# ---------------- 内部状态泄漏与敷衍检测 ----------------
+
+@pytest.mark.parametrize("text", [
+    "（任务完成，没有文字输出）",
+    "（没有回话）",
+    "（没说出话来）",
+])
+def test_internal_state_is_never_sent(text):
+    """这些是程序语言，真人不会这么说话。"""
+    assert humantype.looks_like_leak(text)
+
+
+@pytest.mark.parametrize("text", [
+    "改好了，能用了", "行，那我闭嘴，等你放片头", "在呢 咋了",
+])
+def test_normal_reply_is_not_a_leak(text):
+    assert not humantype.looks_like_leak(text)
+
+
+@pytest.mark.parametrize("text", [
+    "行 那就不说了", "嗯", "好的", "知道了", "可以",
+])
+def test_thin_replies_detected(text):
+    """只应声、没有信息量。"""
+    assert humantype.is_thin(text)
+
+
+@pytest.mark.parametrize("text", [
+    "行，那我闭嘴，等你放片头",
+    "改好了，重启就生效",
+    "在呢 咋了",
+])
+def test_replies_with_substance_are_not_thin(text):
+    """真人也会用「行」开头，但后面一定接实质内容。"""
+    assert not humantype.is_thin(text)
