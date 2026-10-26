@@ -37,6 +37,8 @@
   "group_policy": "mention",
   "group_policy_overrides": {},
   "group_min_chars": 4,
+  "group_after_speak_seconds": 45,
+  "group_skip_at_other": true,
   "public_system_prompt": "",
   "public_persona_path": "",
   "context_enabled": true,
@@ -74,6 +76,40 @@
     "timeout_seconds": 180,
     "python": "",
     "model_dir": ""
+  },
+  "tts": {
+    "enabled": true,
+    "engine": "auto",
+    "sapi_voice": "Microsoft Huihui Desktop",
+    "edge_voice": "zh-CN-XiaoxiaoNeural",
+    "edge_rate": "+0%",
+    "rate": 0,
+    "proxy": "http://127.0.0.1:7892",
+    "timeout_seconds": 30,
+    "max_chars": 200,
+    "cache_dir": ""
+  },
+  "qzone": {
+    "enabled": true,
+    "default_ugc_right": 4
+  },
+  "vision": {
+    "enabled": true,
+    "owner_vision": true,
+    "ocr": true,
+    "ocr_timeout_seconds": 25,
+    "ocr_max_chars": 1200,
+    "ocr_min_chars": 4,
+    "ocr_tmp_dir": "",
+    "describe": {
+      "enabled": true,
+      "settings": "",
+      "model": "claude-haiku-5-5",
+      "proxy": "http://127.0.0.1:7892",
+      "timeout_seconds": 150,
+      "max_per_hour": 20,
+      "max_chars": 400
+    }
   },
   "model": "",
   "bee_settings_path": "",

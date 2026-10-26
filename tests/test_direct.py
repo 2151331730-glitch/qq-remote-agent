@@ -433,3 +433,71 @@ def test_thin_replies_detected(text):
 def test_replies_with_substance_are_not_thin(text):
     """真人也会用「行」开头，但后面一定接实质内容。"""
     assert not humantype.is_thin(text)
+
+
+# ---------------- 防复读：看历史纠偏 ----------------
+
+def test_opener_takes_first_clause():
+    assert humantype.opener("行，那我闭嘴") == "行"
+    assert humantype.opener("看电脑呢，咋了") == "看电脑呢"
+    assert humantype.opener("") == ""
+
+
+def test_question_detection_handles_spoken_chinese():
+    assert humantype.is_question("你看看这个？")
+    assert humantype.is_question("你咋了")
+    assert humantype.is_question("是不是卡住了")
+    assert not humantype.is_question("那算啥")       # 陈述句，别当反问
+    assert not humantype.is_question("行，我唐，你说了算")
+
+
+def test_repeat_against_recent_replies():
+    prev = ["行，我唐，你说了算", "早说了弄不了"]
+    assert humantype.is_repeat("行，我唐，你说了算", prev)
+    assert humantype.is_repeat("行 我唐 你说了算。", prev)      # 标点不同也算
+    assert not humantype.is_repeat("看电脑呢", prev)           # 太短不判
+
+
+def test_style_note_flags_repeated_openers_and_questions():
+    same = [{"role": "assistant", "content": "行，那我看看"}] * 3
+    assert "开头" in humantype.style_note(same)
+    asks = [{"role": "assistant", "content": "咋了？"},
+            {"role": "assistant", "content": "在哪呢"}]
+    assert "反问" in humantype.style_note(asks)
+    assert humantype.style_note([]) == ""
+
+
+def test_retry_replaces_last_assistant_turn(monkeypatch):
+    """重写时不往历史里塞「刚才那句太敷衍」这种提醒——那会把对话记录弄脏。"""
+    c, sent = _mkchat(monkeypatch, reply="第二版")
+    c.ask("owner", "在吗", "S")
+    c.history_for("owner")[-1]["content"] = "第一版"
+    reply, ok = c.ask("owner", "在吗", "S", guide="换个说法", retry=True)
+    assert ok and reply == "第二版"
+    hist = c.history_for("owner")
+    assert [m["role"] for m in hist] == ["user", "assistant"]
+    assert hist[-1]["content"] == "第二版"
+    assert sent[-1]["system"].endswith("换个说法")
+    assert "换个说法" not in json.dumps(hist, ensure_ascii=False)
+
+
+def test_failed_retry_keeps_the_original_reply(monkeypatch):
+    c, _ = _mkchat(monkeypatch, reply="第一版")
+    c.ask("owner", "在吗", "S")
+
+    def boom(req, timeout=None):
+        raise OSError("断了")
+    monkeypatch.setattr(direct.urllib.request, "urlopen", boom)
+    assert c.ask("owner", "在吗", "S", retry=True) == ("", False)
+    hist = c.history_for("owner")
+    assert [m["role"] for m in hist] == ["user", "assistant"]
+    assert hist[-1]["content"] == "第一版"
+
+
+def test_replace_last_assistant_stores_delivered_text(monkeypatch):
+    """发出去的是去过标点、合过条的版本，历史里也该存那一版。"""
+    c, _ = _mkchat(monkeypatch, reply="行。那我看看")
+    c.ask("owner", "在吗", "S")
+    c.replace_last_assistant("owner", "行，那我看看")
+    assert c.history_for("owner")[-1]["content"] == "行，那我看看"
+    c.replace_last_assistant("nobody", "x")     # 空会话不炸

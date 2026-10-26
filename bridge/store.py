@@ -310,6 +310,17 @@ class TaskStore:
                 c.execute("UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
                           ((error or "")[:300], oid))
 
+    def outbox_drop(self, oid, error=None):
+        """标记已处理、但以后不再补发。
+
+        闲聊回复属于时效内容：半小时后补发一句旧对话，比丢了更不像人。
+        补发通道是 raw `send()`，会绕过 humanize —— 曾经一次重启把 20 条
+        带换行和句号的旧回复一口气推给对方。
+        """
+        with self._db() as c:
+            c.execute("UPDATE outbox SET delivered_at=?, attempts=attempts+1, last_error=? "
+                      "WHERE id=?", (time.time(), (error or "")[:300], oid))
+
     def outbox_pending_count(self):
         with self._db() as c:
             return c.execute("SELECT COUNT(*) n FROM outbox WHERE delivered_at IS NULL").fetchone()["n"]

@@ -112,3 +112,60 @@ def test_voice_timeout_option():
     v = voice.Voice({"timeout_seconds": 5})
     assert v.timeout == 5.0
     assert voice.Voice({}).port == 18791
+
+
+# ---------------- 存表情 ----------------
+
+def test_clean_name_strips_path_chars():
+    # 名字会拼进 STICKER_DIR / f"{名字}.ext"，带 ..\ 就能写到表情库外面
+    assert stickers.clean_name(r"..\..\evil") == "evil"
+    assert stickers.clean_name("猫/猫") == "猫猫"
+    assert stickers.clean_name("  猫猫  ") == "猫猫"
+
+
+def test_clean_name_limits_length():
+    assert len(stickers.clean_name("猫" * 40)) == 12
+
+
+def test_clean_name_rejects_empty():
+    assert stickers.clean_name("") == ""
+    assert stickers.clean_name("   ") == ""
+    assert stickers.clean_name("...") == ""
+
+
+def test_pick_save_source_fresh(tmp_path):
+    p = tmp_path / "a.jpg"
+    p.write_bytes(b"\xff\xd8\xff")
+    assert stickers.pick_save_source([str(p)], 100.0, 150.0, ttl=120) == str(p)
+
+
+def test_pick_save_source_stale(tmp_path):
+    p = tmp_path / "a.jpg"
+    p.write_bytes(b"\xff\xd8\xff")
+    # 早上发的图不该在晚上被当成表情存进去
+    assert stickers.pick_save_source([str(p)], 100.0, 900.0, ttl=120) == ""
+
+
+def test_pick_save_source_missing_file_is_skipped(tmp_path):
+    gone = tmp_path / "gone.jpg"
+    ok = tmp_path / "ok.png"
+    ok.write_bytes(b"\x89PNG")
+    assert stickers.pick_save_source([str(gone), str(ok)], 100.0, 110.0) == str(ok)
+
+
+def test_pick_save_source_empty():
+    assert stickers.pick_save_source([], 0, 10) == ""
+
+
+# ---------------- 表情说明书 ----------------
+
+def test_rules_text_empty_menu_is_silent():
+    # 库空着就不能教模型写一个发不出去的标记
+    assert stickers.rules_text("") == ""
+
+
+def test_rules_text_marks_public_extra():
+    private = stickers.rules_text("猫=笑")
+    public = stickers.rules_text("猫=笑", public=True)
+    assert "@@表情:" in private and "群里" not in private
+    assert "群里更别刷表情" in public

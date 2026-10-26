@@ -41,6 +41,9 @@ import humantype
 import modelprofiles
 import voice as voice_mod
 import stickers as sticker_mod
+import tts as tts_mod
+import qzone as qzone_mod
+import vision as vision_mod
 from direct import DirectChat
 from guard import audit, danger_reason_shell, danger_reason_task, tail_events
 from intent import classify
@@ -87,7 +90,10 @@ CHAT_MAX_BUDGET = float(CFG.get("chat_max_budget_usd", 0.12))
 # 闲聊慢的时候给个回音，别让人以为死了
 CHAT_SLOW_NOTE_SEC = int(CFG.get("chat_slow_note_seconds", 45))
 # 额度：防账号被盗后被无限刷（0 = 不限制）
-MAX_TASKS_PER_HOUR = int(CFG.get("max_tasks_per_hour", 30))
+# 2026-10-26 主人拍板：每小时任务数上限取消（默认 0）。原来 30/小时，
+# 闲聊也算在内，正常聊天一小时就能撞上，回一句「🚦 每小时最多 30 个任务」——
+# 既假又拦人。日 token 上限保留，那才是真正防刷的钱袋子。
+MAX_TASKS_PER_HOUR = int(CFG.get("max_tasks_per_hour", 0))
 MAX_TOKENS_PER_DAY = int(CFG.get("max_tokens_per_day", 2_000_000))
 RETENTION_DAYS = int(CFG.get("retention_days", 30))
 # 流式进度：把工具调用转发到 QQ，长任务不再只有"还在执行"
@@ -124,6 +130,52 @@ MERGE_MAX_LINES = int(CFG.get("owner_merge_max_lines", 6))
 # ---- 表情：模型输出 @@表情:名字@@ 时单独发一条「表情」而不是大图 ----
 STICKER_DIR = Path(CFG.get("sticker_dir") or (BASE / "stickers"))
 STICKERS = sticker_mod.StickerBook(STICKER_DIR)
+# ---- 语音条：文字 → TTS（edge-tts 优先、SAPI 兜底）→ QQ record ----
+# 和 voice.py 是**反方向**的两件事：voice.py 把收到的语音转成文字（STT），
+# 这里把要说的话转成语音（TTS）。两个配置段也分开：voice / tts。
+TTS = tts_mod.TTS(dict(CFG.get("tts") or {}))
+# ---- 看图：图片 → 文字（本地 OCR 免费；只有"图里没字"才请视觉模型，花钱）----
+# 为什么必须有这一层：闲聊走 DeepSeek 直连，只收文字；任务通道虽然有 Read，
+# 但把图片塞进上下文同样看不见内容。所以先在本地把图变成字，再喂给模型。
+VISION_CFG = dict(CFG.get("vision") or {})
+VISION = vision_mod.get(VISION_CFG, CLAUDE, str(WORKDIR))
+VISION_ENABLED = bool(VISION_CFG.get("enabled", True))
+# 最近一次主人发来的图片（只放内存，不进 state.json）：`/存表情` 要用它
+PENDING_IMAGES = {"paths": [], "at": 0.0}
+# 存表情的两道上限：图要新（120 秒内发的，免得把三天前的图当表情存了），
+# 大小不超过 1.5MB（QQ 表情一般几十到几百 KB，太大了发出去也糊）
+STICKER_SAVE_TTL = 120
+STICKER_MAX_BYTES = 1500 * 1024
+
+
+async def send_voice(text: str, target_type: str = "private", target_id: int = 0) -> bool:
+    """把一段话合成语音条发出去。失败只记日志：调用方决定要不要改发文字。"""
+    if CLIENT is None:
+        log("语音没发出去：还没连上 NapCat")
+        return False
+    say = tts_mod.clean_text(text, TTS.max_chars)
+    if len(say) < tts_mod.MIN_CHARS:
+        log(f"语音跳过（太短）：{say!r}")
+        return False
+    path, engine = await TTS.synth(say)
+    if not path:
+        log(f"语音合成失败：{TTS.last_error}")
+        return False
+    try:
+        if target_type == "group":
+            await CLIENT.call("send_group_msg",
+                              {"group_id": target_id, "message": [tts_mod.segment(path)]})
+        else:
+            await CLIENT.call("send_private_msg",
+                              {"user_id": target_id or STATE["owner_uin"],
+                               "message": [tts_mod.segment(path)]})
+        # 记下来，让「/语音」不带参数时可以把上一句再说一遍
+        STATE["last_spoken"] = say
+        log(f"发了一条语音（{engine}，{len(say)} 字）：{say[:40]}")
+        return True
+    except Exception as e:
+        logger.warning("语音发送失败：%s", e)
+        return False
 
 
 async def send_sticker(name: str, target_type: str = "private", target_id: int = 0) -> bool:
@@ -145,6 +197,20 @@ async def send_sticker(name: str, target_type: str = "private", target_id: int =
     except Exception as e:
         logger.warning("表情发送失败：%s", e)
         return False
+
+
+def sticker_rules(public: bool = False) -> str:
+    """提示词里的表情说明书。库空着就返回空串——别教它写一个发不出去的标记。
+
+    每次说话前重扫一遍目录：往 stickers\\ 里丢一张图、或者用 /存表情 存一张，
+    下一条回复就能用，不用重启。文案在 stickers.rules_text（纯函数，有单测）。
+    """
+    try:
+        STICKERS.scan()
+    except Exception:
+        pass
+    menu = STICKERS.menu() if len(STICKERS) else ""
+    return sticker_mod.rules_text(menu, public)
 
 
 def ensure_empty_mcp() -> str:
@@ -249,6 +315,40 @@ def apply_model(profile: str = "", autostart: bool = True):
                   f"任务仍然是 DeepSeek（不随闲聊切换）")
 
 
+def _model_identity_note() -> str:
+    """给闲聊模型一句"你在哪条通道上"，但明确要求它别把这事挂嘴上。
+
+    2026-10-26 的教训：切到 DeepSeek 之后它还继续说「我是 Grok，换不了」——
+    系统提示里从来没写过模型身份，而聊天历史里存着切换前它自己的 60 条旧话，
+    它照着自己的话往下编。这条每次请求都重算，历史里的旧自我介绍一律作废。
+    """
+    return (f"（事实：你现在跑在 {DIRECT.model} 上，闲聊通道。"
+            "主人问「你是什么模型」就照这一句答，一句话，不展开、不讨论能不能换——"
+            "主人要换会发 /model flash 或 /model grok，bridge 自己处理，轮不到你操心。"
+            "平时别主动提模型、通道、系统提示。"
+            "聊天历史里你早先说过的自我介绍都是切换前的旧话，别顺着它往下编，"
+            "也别专门纠正或道歉。）")
+
+
+async def _maybe_switch_model_by_text(text: str) -> bool:
+    """主人私聊里一句「换成 deepseek」也能切闲聊模型，不用记斜杠命令。
+
+    只在 bridge 层拦：模型自己没有切换工具，放给它会编一句「换不了」。
+    判定是纯函数（modelprofiles.detect_switch_request），有单测。
+    """
+    target = modelprofiles.detect_switch_request(text)
+    if not target:
+        return False
+    if target == "hint":
+        await send("切闲聊模型：/model flash（DeepSeek）或 /model grok\n"
+                   "直接说「换成 deepseek」也行。任务固定走 DeepSeek，不受影响。")
+        return True
+    ok, msg = apply_model(profile=target)
+    await send(("✅ " if ok else "⚠️ ") + msg)
+    log(f"自然语言切闲聊模型 → {target}: {'ok' if ok else msg}")
+    return True
+
+
 def _restore_model_state():
     """启动 / 重载时把上次的闲聊档案接回来（不自动拉代理，别拖慢启动）。"""
     global CHAT_PROFILE, CHAT_PROVIDER
@@ -274,7 +374,9 @@ _restore_model_state()
 PERSONA_PATH = Path(CFG.get("persona_path") or (BASE / "persona.md"))
 # 风格人格包（WeClone-Skills 结构）：基础规则之外的"像不像本人"，改完 /重载 生效
 PERSONA_PACK_DIR = Path(CFG.get("persona_pack_dir") or (BASE / "persona-pack"))
-PERSONA_PACK_FILES = ("profile.md", "persona_examples.md", "state.md", "guardrails.md")
+# style_learned.md 由 tools/learn_style.py 从真实聊天记录自动生成（人工规则之外的经验值）
+PERSONA_PACK_FILES = ("profile.md", "persona_examples.md", "style_learned.md",
+                      "state.md", "guardrails.md")
 # 长期记忆（纯文本，一行一条）：只在闲聊通道注入提示词
 MEMORY_PATH = Path(CFG.get("memory_path") or (BASE / "memory.md"))
 # 从聊天里学到的行为规则（B 类）。和 memory.md 的区别：
@@ -307,6 +409,17 @@ GROUP_PREFIX = str(CFG.get("group_trigger_prefix") or "")
 GROUP_POLICY = CFG.get("group_policy", "mention")
 GROUP_POLICY_OVERRIDES = dict(CFG.get("group_policy_overrides") or {})
 GROUP_MIN_CHARS = int(CFG.get("group_min_chars", 4))
+# 刚说完一句之后的静默期：真人在群里说完就退场，不会紧接着又接别人的话。
+# 只管"没被 @ 时主动插话"这条路，被点名照回。
+GROUP_AFTER_SPEAK = float(CFG.get("group_after_speak_seconds", 45))
+# 别人在跟别人说话（@ 了群里另一个人）：概率插话一律不接，抢话最不像人
+GROUP_SKIP_AT_OTHER = bool(CFG.get("group_skip_at_other", True))
+# 群聊提示词里的"没话说"出口。没有这句，模型只能硬凑一句废话。
+_PASS_RULE_DEFAULT = (
+    "\n\n群里补充规则：\n"
+    "- 这一条不需要你接、你也确实没话可说时，只回 PASS 三个字母，不要加任何解释。\n"
+    "- 被 @ 了就正常回；别为了接话硬凑，接不上就不接。")
+GROUP_PASS_RULE = str(CFG.get("group_pass_rule") or _PASS_RULE_DEFAULT)
 
 
 def group_policy_for(gid: int):
@@ -498,6 +611,9 @@ def reload_config() -> dict:
     g["GROUP_POLICY"] = CFG.get("group_policy", "mention")
     g["GROUP_POLICY_OVERRIDES"] = dict(CFG.get("group_policy_overrides") or {})
     g["GROUP_MIN_CHARS"] = int(CFG.get("group_min_chars", 4))
+    g["GROUP_AFTER_SPEAK"] = float(CFG.get("group_after_speak_seconds", 45))
+    g["GROUP_SKIP_AT_OTHER"] = bool(CFG.get("group_skip_at_other", True))
+    g["GROUP_PASS_RULE"] = str(CFG.get("group_pass_rule") or _PASS_RULE_DEFAULT)
     g["PUBLIC_ENABLED"] = bool(CFG.get("public_chat", True))
     g["PUBLIC_MAX_PER_HOUR"] = int(CFG.get("public_max_per_hour", 20))
     g["PUBLIC_COOLDOWN"] = float(CFG.get("public_cooldown_seconds", 5))
@@ -529,6 +645,19 @@ def reload_config() -> dict:
     g["TASK_MCP_MODE"] = str(CFG.get("task_mcp_mode") or "empty").lower()
     g["TASK_MAX_TURNS"] = int(CFG.get("task_max_turns", 60))
     g["VOICE_ENABLED"] = bool((CFG.get("voice") or {}).get("enabled", True))
+    # 语音条（TTS）也热重载：换音色、换引擎不用重启。
+    try:
+        g["TTS"] = tts_mod.TTS(dict(CFG.get("tts") or {}))
+    except Exception as e:
+        logger.warning("语音条配置重载失败：%s", e)
+    # 看图也热重载：改 OCR 上限/换视觉模型不用重启。
+    # 注意 reload() 会把旧的 OCR 子进程关掉再开新的（下次看图时才拉起，不等它）。
+    try:
+        g["VISION_CFG"] = dict(CFG.get("vision") or {})
+        g["VISION"] = vision_mod.get(g["VISION_CFG"], CLAUDE, str(WORKDIR))
+        g["VISION_ENABLED"] = bool(g["VISION_CFG"].get("enabled", True))
+    except Exception as e:
+        logger.warning("看图配置重载失败：%s", e)
     g["CHAT_TEMPLATE"] = str(CFG.get("chat_prompt_template") or "")
     g["TASK_TEMPLATE"] = str(
         CFG.get("task_prompt_template") or CFG.get("prompt_template")
@@ -1164,13 +1293,36 @@ def _remember_once(text: str) -> bool:
         return False
 
 
-async def _deliver_human(body: str, tid: str) -> bool:
-    """按真人的节奏把回复发出去。
+# 没话说时的兜底：必须是**人话**。
+# 旧写法「（没说出话来）」会被 looks_like_leak 当成内部状态拦掉，最后退成一句「好」；
+# 而「（没有回话）」在 claude 闲聊那条路上是**直接发出去**的——用户看到括号里写
+# 「没有回话」，等于把程序日志当面念给他听。所以按原因给不同的句子。
+_FALLBACK_LINES = (
+    "嗯 我一下没接上来 你再说一遍",
+    "哈 我卡了一下 再说一遍试试",
+    "我这边没接上 你再说一次",
+)
+
+
+def _fallback_line(reason: str = "") -> str:
+    """兜底话术：按失败原因挑一句正常人会说、又说得清状态的话。"""
+    if reason == "timeout":
+        return "我这边超时了 再问一遍试试"
+    if reason in ("stalled", "max_turns"):
+        return "我转的圈数用光了 再说一次"
+    return random.choice(_FALLBACK_LINES)
+
+
+async def _deliver_human(body: str, tid: str) -> tuple[bool, str]:
+    """按真人的节奏把回复发出去，返回 (是否发出, 实际发出去的文本)。
 
     三道加工，都按实测数据定的（275 条真人发言的统计，见 humantype.py）：
     1. `humanize()` 去书面标点 —— 真人 99% 不打句号，这是最刺眼的机器味
     2. `split_like_human()` —— 真人 84% 只发一条，默认就不拆
     3. `compose_timeline()` —— 首条 1.5~4 秒，不秒回
+
+    返回的文本要写回模型自己的历史（`DIRECT.replace_last_assistant`）：
+    它下一句会模仿自己上一句，历史里存原稿就会一直写作文。
     """
     # 内部状态泄漏（"任务完成，没有文字输出"）绝不发给用户 —— 那是程序语言
     if humantype.looks_like_leak(body):
@@ -1178,6 +1330,9 @@ async def _deliver_human(body: str, tid: str) -> bool:
         body = ""
 
     text = humantype.humanize(body) or body
+    # 漏网的表情标记（写成全角、少一个 @、写成「贴纸」）整段刮掉再发，
+    # 绝不能让「@@表情:猫猫@@」当文字出现在手机上。
+    text = sticker_mod.scrub(text)
     # 学到的行为规则在这里生效：**发出前**用代码检查一遍，不靠模型自觉。
     # 这是「下次别这么说」真的管用的关键。
     text, fired = RULES.apply(text)
@@ -1189,8 +1344,17 @@ async def _deliver_human(body: str, tid: str) -> bool:
     parts = (humantype.split_like_human(text, max_parts=OWNER_BUBBLE_PARTS)
              if OWNER_BUBBLES else [text])
     if not parts:
-        return False
+        return False, ""
     delays = humantype.compose_timeline(parts)
+    # 聊天回复也记一笔发件箱（面板/审计看得到），但**立刻标记已投递**：
+    # 闲聊是时效内容，半小时后补发一句旧对话比丢了更糟，
+    # 而且补发走的是 raw send()，会绕过 humanize —— 重启后会一口气冒出
+    # 二十条带换行和句号的旧回复，比不说话更假。
+    oid = None
+    try:
+        oid = STORE.outbox_add("，".join(parts), tid)
+    except Exception:
+        pass
     ok = True
     for i, part in enumerate(parts):
         if delays[i] > 0:
@@ -1198,29 +1362,25 @@ async def _deliver_human(body: str, tid: str) -> bool:
         if not await send(part):
             ok = False
             break
-    if ok:
+    if oid is not None:
         try:
-            STORE.outbox_add(body, tid)
+            STORE.outbox_drop(oid, None if ok else "chat send failed")
         except Exception:
             pass
-    return ok
+    if ok:
+        # 记下最后一句，供「/语音」不带参数时重念一遍
+        STATE["last_spoken"] = "，".join(parts)
+    return ok, "，".join(parts)
 
 
-def _direct_system() -> str:
+def _direct_system(history=None) -> str:
     """直连通道的系统提示：人格 + 长期记忆 + 聊天格式约束。
 
-    格式那段不是随便写的——它是把 275 条**真人**发言的统计结论直接喂给模型：
+    格式那段不是随便写的——它是把真人发言的统计结论直接喂给模型。
+    数字由 `tools/learn_style.py` 从真实聊天记录算出（396 条 / 232 段）。
 
-    | 特征 | 真人实测 |
-    |---|---|
-    | 句末打标点 | 0% |
-    | 含句号 | 1%（4/275） |
-    | 完全不带标点 | 68% |
-    | 每条字数 | 中位 11，p90 为 23，最长 50 |
-    | 一轮发几条 | 84% 只发 1 条 |
-
-    这些数字比"像真人一点"这种形容词有效得多——模型会照着具体指标生成。
-    就算它没照做，`humantype.humanize()` 还会再兜一层去标点。
+    改语料后重跑那个脚本，它会更新 `记忆\\style_learned.md`（人格包一员）；
+    下面 CHAT_STYLE_RULE 里的数字是同一批统计的结论，量级变了再手改一次即可。
     """
     parts = [PERSONA] if PERSONA else []
     try:
@@ -1230,42 +1390,51 @@ def _direct_system() -> str:
     if mem:
         parts.append("（你记得的关于主人的事，自然用上，别逐条复述：\n" + mem + "）")
     parts.append(CHAT_STYLE_RULE)
-    # 有表情库才教它用；库里是空的就别提，免得它写一个发不出去的标记。
-    # 每次说话前重扫一遍目录：往 stickers\ 里丢一张图就能立刻用，不用重启。
-    try:
-        STICKERS.scan()
-    except Exception:
-        pass
-    menu = STICKERS.menu() if len(STICKERS) else ""
-    if menu:
-        parts.append(
-            "（你手里有这些 QQ 表情，格式是 名字=它的样子：" + menu + "\n"
-            "想发表情就在回复最后单独一行写 @@表情:名字@@，系统会把它摘掉、单独发一张。\n"
-            "一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，"
-            "跟人发微信一个样。别同一个连着用。"
-            "表情经常比文字更贴，只有一两句话的时候尤其适合。）")
+    tip = sticker_rules()
+    if tip:
+        parts.append(tip)
     parts.append(ESCALATE_RULE)
+    parts.append(_model_identity_note())
+    # 动态提醒：最近几条如果在复读开头、连续反问、或者越长越啰嗦，就当场点出来。
+    # 提示词只能定基调，这一条是看它实际说了什么再纠偏。
+    note = humantype.style_note(history) if history is not None else ""
+    if note:
+        parts.append(note)
     return "\n\n".join(p for p in parts if p)
 
 
 # 聊天格式约束：直接写真人聊天的实测数据，比任何形容词都管用
 CHAT_STYLE_RULE = (
-    "（现在是手机 QQ 私聊，按下面对真人聊天的实测数据来说话——\n"
-    "· 每条 10~20 字，最多别超过 30 字。实测真人中位 11 字，90% 在 23 字以内\n"
-    "· **不要打句号**。实测 275 条真人消息里只有 4 条有句号（1%），68% 完全不带标点\n"
-    "· 要断开就用逗号，或者干脆不断，一口气说完\n"
-    "· 感叹号和问号可以有，但别滥用\n"
-    "· **默认只回一条**。实测 84% 的时候真人只发一条消息。只有真的说不完"
-    "才换行分成两条，绝对不要发三条以上\n"
-    "· 不用 Markdown：标题、表格、列表、代码块、加粗一律不要\n"
-    "· 不要总结对方刚说的话，不要「首先其次最后」，不要客服腔"
-    "（「好的」「希望对你有帮助」「还有什么可以帮您」）\n"
-    "· 不要每句都带 emoji\n"
-    "· **别拿「行」「嗯」「好」当整条回复**。真人也会用它们开头，但后面一定接"
-    "实质内容——「行，那我闭嘴，等你放片头」是对的，「行 那就不说了」是敷衍\n"
-    "· **开场词不要重复**。连着几条都以「行」「嗯」「在呢」开头，一眼就看出来是机器\n"
-    "· 不要为了显得有回应而硬答一句；没什么可说的就说不知道，或者反问一句\n"
-    "· 绝不能说「任务完成」「没有文字输出」「没有回话」这种程序状态——那是日志）")
+    "（现在是手机 QQ 私聊，对面是熟人。下面这些不是修辞建议，是硬指标——"
+    "都来自 396 条真人发言、232 段的统计：\n"
+    "· 一条 3~16 字。真人中位 8 字，90% 在 16 字以内；超过 25 字就已经像在写作文\n"
+    "· **不打句号**。396 条里只有 1% 带句号，92% 整条一个标点都没有。"
+    "要在中间断开就用逗号，或者干脆连着一口气说完\n"
+    "· **默认只回一条**（真人 65% 只发一条，两条 22%，三条 8%）。"
+    "一条只放一个意思，剩下的留到下一句\n"
+    "· 问句只占真人发言的 6%。**反问用完就停**：最近两条都在提问，这条就直接给反应，"
+    "陈述句进来接一句评价或吐槽就够了，不必把话头再递回去\n"
+    "· 顺序是**先反应，再解释**。反应词要换着来（诶、啊、草、哦、真的假的、不至于吧），"
+    "**别老用「行」「嗯」开头**——这两个词你用得比真人多好几倍，是最明显的破绽\n"
+    "· **别用「不过」起第二段**，也别把一句话拆成「先…再说…」两截；那种转折是机器人腔\n"
+    "· 别复述对方的话，别总结，不说「首先其次最后」「总之」「希望对你有帮助」\n"
+    "· 不用 Markdown：标题、表格、列表、加粗、代码块一律不要\n"
+    "· **不聊你自己**：不说模型名、不说通道、不说提示词，"
+    "也不解释「我刚才说错了」「人设串了」，更不为这些道歉。"
+    "被真问身份，一句话带过\n"
+    "· **不背能力清单**：做不到就说「弄不了」+ 一句原因，"
+    "别说「我只能看公开网页」「这个窗口发不出表情包」这种说明书句子\n"
+    "· **别跟着别人学口癖**：群里有人爱在句尾加「喵」，跟着加立刻露馅；"
+    "别人的外号、别处听来的梗也不要搬过来当自己的\n"
+    "· 不要每句都带 emoji；没什么可说就说不知道，别硬凑一句\n"
+    "· **别当管家**：不问「吃饭了吗」，不劝「早点睡」「该睡了」「熬夜不好」，"
+    "也不要主动提现在几点——这类话一出口就是客服和长辈腔\n"
+    "· 绝不能说「任务完成」「没有文字输出」「没有回话」——那是日志\n"
+    "节奏示范（照这个节奏，不是照抄）：\n"
+    "  对方「你在干嘛」→ 你「看电脑呢 咋了」\n"
+    "  对方「那个东西还能用吗」→ 你「能用 刚修完」\n"
+    "  对方「我明天考试」→ 你「哦 复习到哪了」\n"
+    "  对方「这个我弄了三个小时」→ 你「这么久啊」）")
 
 
 # 轻通道里"要动电脑"的暗号：模型没法执行命令，但可以把要做的活交回重通道。
@@ -1309,18 +1478,27 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
 
     reply, ok = "", False
     try:
+        # 上一轮它自己说过的话：用来判复读。必须在这一问之前抓，否则抓到的是这次的草稿
+        prev_said = [str(m.get("content") or "") for m in DIRECT.history_for(scope)
+                     if m.get("role") == "assistant"][-3:]
+        sys_prompt = _direct_system(DIRECT.history_for(scope))
         reply, ok = await asyncio.to_thread(
-            DIRECT.ask, scope, text, _direct_system(), None)
-        # 敷衍检测：只回「行」「好的」这类没有信息量的应声，再要一次。
-        # 实测机器人反复用「行 那就不说了」收尾，而真人会接实质内容
-        # （「行，那我闭嘴，等你放片头」）。只重试一次，避免翻倍成本。
+            DIRECT.ask, scope, text, sys_prompt, None)
+        # 两道质检：①只有应声没有内容 ②跟最近三句几乎一样（复读机）。
+        # 命中就重写一次，成本约一倍，但比让主人反复看到同一句话便宜。
+        bad = ""
         if ok and humantype.is_thin(reply):
-            log(f"回复太薄（{reply[:20]}），再要一句")
+            bad = "太敷衍了"
+        elif ok and humantype.is_repeat(reply, prev_said):
+            bad = "跟前面说过的话重复"
+        if bad:
+            log(f"回复不合格（{bad}：{reply[:24]}），重写一次")
             again, ok2 = await asyncio.to_thread(
-                DIRECT.ask, scope,
-                "（刚才那句太敷衍了。接着说一句实在的，不要只应一声）",
-                _direct_system(), None)
-            if ok2 and again and not humantype.is_thin(again):
+                DIRECT.ask, scope, text, sys_prompt, None,
+                f"（刚才那版{ bad }，不要了。换个说法，直接给一句实在的，"
+                "别解释为什么，也别重复上一句的开头）", True)
+            if ok2 and again and not humantype.is_thin(again) \
+                    and not humantype.is_repeat(again, prev_said):
                 reply = again
     except Exception as e:
         logger.exception("直连闲聊异常")
@@ -1356,9 +1534,13 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
     # 不该污染 `记忆/transcripts/`，否则下次垫底会把这些内容当成真实对话。
     from_qq = row["source"] == "qq"
     if speak:
-        await _deliver_human(speak, tid)
+        sent_ok, sent_text = await _deliver_human(speak, tid)
+        # 历史里换成**实际发出去的那一版**（去过标点、合过条）。模型下一句会模仿
+        # 自己的历史：存原稿它就继续写作文，存成品它才学得会短句。
+        if sent_text:
+            DIRECT.replace_last_assistant(scope, sent_text)
         if from_qq:
-            _record("owner", int(CFG.get("bot_uin") or 0), "我", speak)
+            _record("owner", int(CFG.get("bot_uin") or 0), "我", sent_text or speak)
     if sticker_name:
         # 先说话再贴表情，跟真人顺序一致；表情没有文字也算回了话（不触发「没说出话来」）
         await asyncio.sleep(random.uniform(0.4, 1.1))
@@ -1373,7 +1555,7 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
         else:
             await send(f"想查一下但排不进去（{res.get('status')}），等会儿再问我。")
     elif not speak and not sticker_name:
-        await _deliver_human("（没说出话来）", tid)
+        await _deliver_human(_fallback_line(), tid)
     _cleanup(tid)
 
 
@@ -1490,7 +1672,7 @@ async def _execute_claude_chat(row, cwd):
     body = _plain(reply)
     if kind == "chat":
         # 闲聊：不要 ✅ 前缀、不要 ⏱ 尾巴，直接说话
-        await deliver(body or "（没有回话）", tid, bubbles=True)
+        await deliver(body or _fallback_line(err_kind), tid, bubbles=True)
         _record("owner", int(CFG.get("bot_uin") or 0), "我", body)
     else:
         footer = f"\n\n⏱ {seconds:.1f}s · {tin}→{tout} tok" if SHOW_FOOTER else ""
@@ -1565,9 +1747,19 @@ async def send_to(target_type: str, target_id: int, text: str) -> bool:
 
 
 async def _send_bubbles(target_type: str, target_id: int, body: str) -> bool:
-    """分条发送：长回复拆成 2~3 条，中间随机停顿，像人在打字。"""
-    parts = (chatstyle.split_bubbles(body, PUBLIC_BUBBLE_MIN, PUBLIC_BUBBLE_LIMIT,
-                                     PUBLIC_BUBBLE_PARTS)
+    """分条发送：先按真人习惯去掉书面标点，再切成 1~2 条，中间随机停顿。
+
+    群聊和陌生人以前只经过 chatstyle 分条，句号原样发出去——275 条真人消息里
+    只有 4 条有句号，这是群里最刺眼的机器味。主人私聊那条路早就 humanize 过了。
+    """
+    body = humantype.humanize(body) or body
+    # 表情标记在公开通道里没有发送能力，但 model 有时还是会写上来 —— 刮掉，
+    # 免得「@@表情:猫猫@@」被当成普通文字发到群里。整条只有标记就干脆不发。
+    body = sticker_mod.scrub(body)
+    if not body:
+        return False
+    parts = (humantype.split_like_human(body, max_parts=PUBLIC_BUBBLE_PARTS,
+                                       soft_limit=PUBLIC_BUBBLE_LIMIT)
              if PUBLIC_BUBBLES else [body])
     ok = True
     for i, part in enumerate(parts):
@@ -1580,8 +1772,12 @@ async def _send_bubbles(target_type: str, target_id: int, body: str) -> bool:
 
 
 def _group_text(data, self_id):
-    """从群消息里取出文字，并判断有没有 @ 机器人。"""
+    """从群消息里取出文字，并判断有没有 @ 机器人 / @ 了群里别人。
+
+    第三个返回值是"在跟别人说话"：真人看到 @ 别人的消息不会插嘴。
+    """
     at_me = False
+    at_other = False
     parts = []
     segs = data.get("message")
     if isinstance(segs, list) and segs:
@@ -1595,6 +1791,7 @@ def _group_text(data, self_id):
                 if qq == str(self_id):
                     at_me = True
                 elif qq and qq != "all":
+                    at_other = True
                     parts.append(f"@{qq} ")
             # image / face / reply 等一律忽略：公开通道不处理文件
         text = "".join(parts)
@@ -1602,8 +1799,10 @@ def _group_text(data, self_id):
         text = data.get("raw_message") or ""
         if re.search(rf"\[CQ:at,qq={self_id}[,\]]", text):
             at_me = True
+        if re.search(r"\[CQ:at,qq=(?!all\b)\d+", text):
+            at_other = not at_me
         text = re.sub(r"\[CQ:[^\]]+\]", "", text)
-    return text.strip(), at_me
+    return text.strip(), at_me, at_other
 
 
 def _record(scope: str, uid, name: str, text: str):
@@ -1657,13 +1856,18 @@ async def fetch_history(group_id=None, user_id=None) -> str:
 
 
 async def handle_public(scope: str, target_type: str, target_id: int, text: str,
-                        who: str = ""):
-    """公开聊天的一次问答：限流 → 串行执行（无工具）→ 发回原会话。"""
+                        who: str = "", addressed: bool = False):
+    """公开聊天的一次问答：限流 → 串行执行（无工具）→ 发回原会话。
+
+    addressed 只对群聊有意义：被 @ 时模型说 PASS 也算"必须应一声"；
+    没被 @ 时 PASS 就是真沉默，什么都不发。
+    """
     allowed, why = public_gate(scope)
     if not allowed:
         log(f"公开聊天跳过（{why}）：{scope}")
         METRICS.inc("qq_remote_public_total", {"result": why})
         return False
+    is_group = target_type == "group" or scope.startswith("group:")
     text = (text or "").strip()[:PUBLIC_MAX_INPUT]
     if not text:
         return False
@@ -1682,6 +1886,12 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
             group_id=target_id if target_type == "group" else None,
             user_id=target_id if target_type == "private" else None)
     prompt = PUBLIC_TEMPLATE.replace("{task}", text)
+    if is_group:
+        prompt += GROUP_PASS_RULE
+    # 表情说明书：库空着时是空串，等于这条能力不存在
+    sticker_tip = sticker_rules(public=True)
+    if sticker_tip:
+        prompt += "\n\n" + sticker_tip
     reply, cost, tin, tout, err = "", 0.0, 0, 0, "ok"
     ok = False
     if PUBLIC_DIRECT and DIRECT.available():
@@ -1690,6 +1900,10 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
         # 否则同一段历史会被算两次。
         try:
             sys_prompt = load_public_system() or PUBLIC_TEMPLATE
+            if is_group:
+                sys_prompt += GROUP_PASS_RULE
+            if sticker_tip:
+                sys_prompt += "\n\n" + sticker_tip
             if not DIRECT.history_for(scope):
                 DIRECT.seed_history(scope, history_text)
             got, ok = await asyncio.to_thread(
@@ -1717,10 +1931,35 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
             ok, reply, tin, tout, err = False, "", 0, 0, "exception"
     PUBLIC_STATE["pending"] -= 1
 
-    body = _plain(reply or "").strip() or "（我这边没说出话来，再说一遍试试？）"
-    body = body[:PUBLIC_MAX_REPLY]
-    sent = await _send_bubbles(target_type, target_id, body)
-    _record(scope, int(CFG.get("bot_uin") or 0), "我", body)
+    if is_group and ok and policy.is_pass(reply):
+        # 沉默：群里没必要每条都接，先由提示词把话头放掉，这里兜住。
+        if not addressed:
+            log(f"没插话（模型 PASS）：{scope}")
+            METRICS.inc("qq_remote_public_total", {"result": "pass"})
+            audit(AUDIT_PATH, event="public_pass", scope=scope, who=who,
+                  tokens_in=tin, tokens_out=tout,
+                  seconds=round(time.time() - started, 1))
+            return False
+        # 被点名了还沉默，对方会以为机器人掉线：至少应一声
+        reply = policy.pick_hello()
+        log(f"被 @ 但模型 PASS，改回一句应声：{scope}")
+
+    # 表情标记先摘出来再发：跟主人私聊那条路一致（先说话，再单独贴一张）
+    body = _plain(reply or "").strip()
+    body, sticker_name = sticker_mod.extract(body)
+    body = (body or "").strip()[:PUBLIC_MAX_REPLY]
+    if not body and not sticker_name:
+        body = _fallback_line(err)
+    sent = False
+    if body:
+        sent = await _send_bubbles(target_type, target_id, body)
+        _record(scope, int(CFG.get("bot_uin") or 0), "我", body)
+    if sticker_name:
+        # 表情没有文字也算回了话，不然"只发了个表情"会被记成失败
+        if body:
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+        sent = await send_sticker(sticker_name, target_type, target_id) or sent
+        _record(scope, int(CFG.get("bot_uin") or 0), "我", f"[表情:{sticker_name}]")
     if tin > SESSION_TOKEN_LIMIT:
         set_session("public", "", scope)   # 会话太长就换新的，避免每句都背着整段历史
     METRICS.inc("qq_remote_public_total", {"result": "ok" if ok else (err or "failed")})
@@ -1731,6 +1970,15 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
 
 async def on_public_private(data, uid: int, text: str):
     text = re.sub(r"\[CQ:[^\]]+\]", "", text or "").strip()
+    # 图里的字（本地 OCR，免费）照样能读：对方发张截图问"这是什么"很常见。
+    # 只走 OCR，**不走视觉模型**——公开通道不给陌生人的图花钱，也不把图传给外部 API。
+    image_note = ""
+    if not text and _has_image(data):
+        image_note = await _ocr_only(data)
+    if not text and image_note:
+        text = "（我发了张图）"
+    if image_note:
+        text = text + "\n\n" + image_note
     if not text:
         log(f"陌生人私聊（没有文字，忽略）：{uid}")
         return
@@ -1761,7 +2009,7 @@ async def on_group_message(data, self_id: int):
     uid = int(data.get("user_id") or 0)
     if not gid or (self_id and uid == self_id):
         return
-    text, at_me = _group_text(data, self_id)
+    text, at_me, at_other = _group_text(data, self_id)
     sender = data.get("sender") or {}
     name = sender.get("card") or sender.get("nickname") or str(uid)
     # 群里的闲聊也落盘：被 @ 的时候这些就是"前情"（只写本地，不花 token）
@@ -1773,10 +2021,22 @@ async def on_group_message(data, self_id: int):
         addressed = True
         text = text[len(GROUP_PREFIX):].strip()
     policy_value = group_policy_for(gid)
+    scope = f"group:{gid}"
     if not addressed:
         # 概率插话：像真人那样偶尔接一句；太短的消息（"嗯""哈哈"）不凑热闹
         if len(text) < GROUP_MIN_CHARS or not policy.should_reply(policy_value, False):
             METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
+            return
+        # 别人在跟群里另一个人说话，别抢话
+        if GROUP_SKIP_AT_OTHER and at_other:
+            METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
+            log(f"群消息 [group:{gid}] uid={uid} @ 了别人，不插话：{text[:40]}")
+            return
+        # 刚说完一句就退场：真人不会一句接一句地刷屏
+        quiet = time.time() - PUBLIC_STATE["last"].get(scope, 0)
+        if quiet < GROUP_AFTER_SPEAK:
+            METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
+            log(f"群里刚说过话（{quiet:.0f}s 前），这次不接：{scope}")
             return
         METRICS.inc("qq_remote_group_messages_total", {"addressed": "random"})
         log(f"群消息 [group:{gid}] uid={uid} 概率插话（policy={policy_value}）：{text[:60]}")
@@ -1784,12 +2044,23 @@ async def on_group_message(data, self_id: int):
         # 无论后面怎么处理，先留一行证据：排查"群消息到底有没有到桥"只看这句
         METRICS.inc("qq_remote_group_messages_total", {"addressed": "yes"})
         log(f"群消息 [group:{gid}] uid={uid} at={at_me} 文本={text[:60] or '（空）'}")
+    # 只发图、不说话的群消息：只有被 @ 时才读（而且只读字，不花钱）。
+    # 没被 @ 的图连 min_chars 那道闸都过不去，群里的表情包/截图不会换来一句评论。
+    image_note = ""
+    if not text and addressed and _has_image(data):
+        image_note = await _ocr_only(data)
+        if image_note:
+            text = "（发了张图）"
+            log(f"群消息 [group:{gid}] 只发了图，读出了字：{image_note[:60]}")
     if not text:
         if addressed:
             await _group_hello(gid, uid)
         return
+    if image_note:
+        text = text + "\n\n" + image_note
     # 群聊一律只陪聊：即使是主人，也不在群里执行任务（结果会公开可见）
-    await handle_public(f"group:{gid}", "group", gid, text, who=f"{name}({uid})")
+    await handle_public(scope, "group", gid, text, who=f"{name}({uid})",
+                        addressed=addressed)
 
 
 async def reminder_loop():
@@ -1823,9 +2094,15 @@ HELP = """命令（只列常用的，其余见 /帮助 全部）：
 /提醒 20:30 交作业   到点提醒
 /提醒列表   看还没到点的
 /重载   改完 config.json 不用重启
+/学   重新学一遍聊天记录（更新说话风格），可以常发
 /完整 <事>   这条任务放开全部工具和 MCP（默认只有六个工具、不加载 MCP）
 /model grok   换闲聊模型（grok / flash），任务永远 DeepSeek 不受影响
+/语音 <文本>   把这句话发成语音条（不带文本 = 把上一句再说一遍）
+/存表情 <名字>   把刚发的图存成表情（120 秒内有效）
+/表情   看表情库　/发表情 <名字>   发一张
+/说说 <文字>   存一条说说草稿，发 /说说发 才真发（对外可见，默认好友可见）
 发语音   直接说，本机转成文字（转不出来会说没听清）
+发图片   本机自动认图里的字（截图/报错窗口最准），认不出字才看图
 !<命令>   直接执行 PowerShell
 其他任何文字 = 自动判断闲聊或任务
 
@@ -1841,6 +2118,125 @@ def _fmt_ms(ms):
     if ms < 60000:
         return f"{ms / 1000:.1f}s"
     return f"{ms / 60000:.1f}min"
+
+
+async def _handle_qzone(t: str) -> None:
+    """QQ 空间说说：起草 → 再确认 → 才发。
+
+    为什么非要两步：说说发出去是**对外可见**的。机器人一条乱发的说说，比不回复
+    严重得多；而且这是一次不可撤回的社交动作（能删，但别人可能已经看见）。
+    所以 `/说说 文字` 只存草稿，`/说说发` 才真发。
+    """
+    cfg = CFG.get("qzone") or {}
+    if not bool(cfg.get("enabled", True)):
+        await send("说说功能关着（config.json 的 qzone.enabled）。")
+        return
+    default_right = int(cfg.get("default_ugc_right", qzone_mod.DEFAULT_RIGHT))
+    # 命令有三种写法：/说说发、/说说 发、/qzone 发 —— 先把前缀剥掉再解析
+    body = t.strip()
+    head = "/qzone" if body.lower().startswith("/qzone") else "/说说"
+    arg = body[len(head):].strip()
+    draft = STATE.get("qzone_draft") or {}
+
+    if not arg or arg.lower() in ("看", "草稿", "?", "？"):
+        if draft:
+            ok, why = qzone_mod.draft_ok(draft)
+            if ok:
+                await send(f"📝 现在有草稿（{qzone_mod.right_label(draft.get('right'))}可见）：\n"
+                           f"{draft.get('content')}\n\n"
+                           f"发：/说说发　取消：/说说取消　改：/说说 新内容")
+            else:
+                await send(why)
+                STATE["qzone_draft"] = {}
+        else:
+            await send("用法：\n/说说 今天好热   先存草稿\n"
+                       "/说说发   发出去（好友可见）\n"
+                       "/说说私密 内容   只自己可见\n"
+                       "/说说取消   丢掉草稿")
+        return
+
+    low_arg = arg.lower()
+    if low_arg in ("发", "发布", "send", "post", "sure"):
+        ok, why = qzone_mod.draft_ok(draft)
+        if not ok:
+            await send(why)
+            STATE["qzone_draft"] = {}
+            return
+        done, msg = await qzone_mod.publish(
+            CLIENT, draft.get("content"), ugc_right=draft.get("right") or default_right)
+        log(f"/说说发：{msg}｜{str(draft.get('content'))[:60]}")
+        audit(AUDIT_PATH, event="qzone_publish", ok=done,
+              ugc_right=draft.get("right"), content=str(draft.get("content"))[:500])
+        if done:
+            STATE["qzone_draft"] = {}
+            await send("✅ " + msg)
+        else:
+            await send("⚠️ " + msg + "\n草稿还留着，可以再发一次或改内容。")
+        return
+
+    if low_arg in ("取消", "删", "清空", "cancel"):
+        if draft:
+            STATE["qzone_draft"] = {}
+            await send("🗑 草稿丢了。")
+        else:
+            await send("本来就没有草稿。")
+        return
+
+    right = default_right
+    for word in ("私密 ", "仅自己 ", "自己可见 "):
+        if arg.startswith(word):
+            right = 64
+            arg = arg[len(word):].strip()
+            break
+    for word in ("公开 ", "所有人 "):
+        if arg.startswith(word):
+            right = 1
+            arg = arg[len(word):].strip()
+            break
+    if not arg:
+        await send("要写点什么？例：/说说 今天好热")
+        return
+    if len(arg) > qzone_mod.MAX_CONTENT:
+        await send(f"太长了（{len(arg)} 字），说说最多 {qzone_mod.MAX_CONTENT} 字。")
+        return
+    STATE["qzone_draft"] = {"content": arg, "right": right, "at": time.time()}
+    await send(f"📝 草稿存好了（{qzone_mod.right_label(right)}可见）：\n{arg}\n\n"
+               f"确认发：/说说发　取消：/说说取消")
+    log(f"/说说 起草（{right}）：{arg[:60]}")
+
+
+async def _handle_save_sticker(name: str) -> None:
+    """把主人最近发来的那张图存进表情库。"""
+    src = sticker_mod.pick_save_source(PENDING_IMAGES.get("paths"),
+                                       PENDING_IMAGES.get("at"), time.time(),
+                                       STICKER_SAVE_TTL)
+    if not src:
+        await send(f"没有可存的图。先把图发给我，然后 {STICKER_SAVE_TTL} 秒内发"
+                   f"「/存表情 名字」。")
+        return
+    nm = sticker_mod.clean_name(name)
+    if not nm:
+        await send("要给表情起个名字：/存表情 猫猫")
+        return
+    try:
+        blob = Path(src).read_bytes()
+    except Exception as e:
+        await send(f"读不到那张图：{e}")
+        return
+    if len(blob) > STICKER_MAX_BYTES:
+        await send(f"图太大了（{len(blob) // 1024} KB），表情一般几十到几百 KB。")
+        return
+    dest = STICKER_DIR / f"{nm}{vision_mod.sniff_ext(blob)}"
+    try:
+        STICKER_DIR.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob)
+        STICKERS.scan()
+    except Exception as e:
+        await send(f"存不进去：{e}")
+        return
+    log(f"存表情：{dest.name}（{len(blob)} 字节）")
+    await send(f"✅ 存好了：{nm}（现在一共 {len(STICKERS)} 张）\n"
+               f"发它：/发表情 {nm}　或者直接跟我说「来个{nm}」")
 
 
 async def handle_command(text: str) -> bool:
@@ -2081,6 +2477,29 @@ async def handle_command(text: str) -> bool:
                    f"最短 {info['group_min_chars']} 字）")
         return True
 
+    if low in ("/学", "/learn"):
+        # 从聊天记录重算语料指标，再热重载人格包。手机上就能做，不用回电脑跑脚本。
+        # 脚本只读 transcripts、只写 记忆\style_learned.md，跑坏了最多是样本变差。
+        script = BASE.parent / "tools" / "learn_style.py"
+        if not script.exists():
+            await send("⚠️ 找不到 tools\\learn_style.py")
+            return True
+        try:
+            out = subprocess.run([sys.executable, str(script)],
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 timeout=120, cwd=str(BASE.parent))
+        except Exception as e:
+            await send(f"⚠️ 学失败了：{e}")
+            return True
+        tail = [x for x in (out.stdout or "").strip().splitlines() if x][-4:]
+        if out.returncode != 0:
+            await send("⚠️ 学失败了：\n" + "\n".join(tail[-2:]))
+            return True
+        globals()["PERSONA"] = _load_persona()
+        log(f"语料学习完成，PERSONA 现在 {len(globals()['PERSONA'])} 字")
+        await send("📚 已重学聊天记录\n" + "\n".join(tail))
+        return True
+
     if low in ("/心跳", "/ping"):
         await send("🏓 我在。")
         return True
@@ -2091,7 +2510,7 @@ async def handle_command(text: str) -> bool:
             lane = "bee（beeapi.ai）" if CHAT_PROVIDER == "bee" else "DeepSeek 直连"
             await send(f"闲聊模型：{DIRECT.model} @ {lane}\n"
                        f"任务模型：{MODEL or '端点默认'} @ DeepSeek（固定，不随闲聊切换）\n"
-                       f"切闲聊：/model grok | flash（deepseek）\n"
+                       f"切闲聊：/model grok | flash（deepseek），或直接说「换成 deepseek」\n"
                        f"状态落盘，重启也记得")
             return True
         if arg.lower() in ("list", "列表"):
@@ -2109,6 +2528,61 @@ async def handle_command(text: str) -> bool:
         st = STORE.stats()
         await send(f"今日（24h）：{st['window_runs']} 次 · 入 {st['tokens_in'] / 1000:.0f}k / 出 {st['tokens_out'] / 1000:.0f}k tok\n"
                    f"估算花费 24h ${st['window_cost']:.3f} · 累计 ${st['total_cost']:.3f}")
+        return True
+
+    if low.startswith("/说说") or low.startswith("/qzone"):
+        await _handle_qzone(t)
+        return True
+
+    if low.startswith("/语音") or low.startswith("/tts"):
+        parts = t.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not TTS.available():
+            await send("语音条没开（config.json 里 tts.enabled）。")
+            return True
+        if arg:
+            said = arg
+        else:
+            # 不带参数 = 把上一句再说一遍（语音），省得重打
+            said = str(STATE.get("last_spoken") or "").strip()
+            if not said:
+                await send("要念什么？用法：/语音 今天好热")
+                return True
+        if await send_voice(said):
+            return True
+        # 合成或发送失败就退回文字，别让对面等一条永远不会来的语音
+        await send(f"语音没发出去（{TTS.last_error or '未知原因'}），我发文字：\n{said[:200]}")
+        return True
+
+    if low.startswith("/存表情") or low.startswith("/存贴纸"):
+        parts = t.split(maxsplit=1)
+        await _handle_save_sticker(parts[1].strip() if len(parts) > 1 else "")
+        return True
+
+    if low in ("/表情", "/表情列表", "/stickers", "/贴纸"):
+        STICKERS.scan()
+        if not len(STICKERS):
+            await send("表情库是空的。\n先发我一张图，再发「/存表情 名字」（120 秒内有效）；"
+                       "也可以把图片直接丢进 bridge\\stickers\\，文件名就是名字。")
+        else:
+            names = list(STICKERS._items)[:40]
+            await send(f"😶 现有 {len(STICKERS)} 张表情：\n" + "、".join(names)
+                       + "\n发它：/发表情 <名字>")
+        return True
+
+    if low.startswith("/发表情") or low.startswith("/发贴纸"):
+        parts = t.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        STICKERS.scan()
+        if not len(STICKERS):
+            await send("表情库是空的。先发我一张图，再 /存表情 名字。")
+            return True
+        if not arg:
+            await send("发哪个？" + "、".join(list(STICKERS._items)[:20]))
+            return True
+        if await send_sticker(arg):
+            return True
+        await send(f"没有叫「{arg}」的表情。发 /表情 看现有的。")
         return True
 
     if low.startswith("/日志") or low.startswith("/log"):
@@ -2267,32 +2741,126 @@ async def handle_shell(text: str):
 INBOX = BASE / "tmp" / "inbox"
 
 
-async def _save_images(data):
-    """把消息里的图片分段下载到本地，返回路径列表（供模型 Read）。"""
+def _has_image(data) -> bool:
+    """这条消息里有没有图（结构化分段、CQ 码字符串两种形态都认）。"""
+    segs = data.get("message")
+    if isinstance(segs, list) and any(
+            isinstance(s, dict) and s.get("type") == "image" for s in segs):
+        return True
+    return bool(re.search(r"\[CQ:image,", str(data.get("raw_message") or "")))
+
+
+async def _image_bytes(seg) -> bytes:
+    """一个 image 段 → 图片字节。三条来源依次试，全失败返回空。
+
+    比"只认 url"多兜两条：有的配置只给本地缓存路径，有的什么都不给、
+    得用 get_image 现要（给的可能是本地文件，也可能是 base64）。
+    """
+    import base64
     import urllib.request
+    d = seg.get("data") or {}
+    for key in ("path", "file"):
+        p = str(d.get(key) or "")
+        if p and os.path.isfile(p):
+            try:
+                return Path(p).read_bytes()
+            except Exception as e:
+                logger.warning("图片本地读取失败：%s", e)
+    for key in ("url", "file_url", "file"):
+        u = str(d.get(key) or "").replace("&amp;", "&")
+        if not u.startswith("http"):
+            continue
+        try:
+            def _dl(x=u):
+                with urllib.request.urlopen(x, timeout=20) as r:
+                    return r.read()
+            blob = await asyncio.to_thread(_dl)
+            if blob:
+                return blob
+        except Exception as e:
+            logger.warning("图片下载失败（%s）：%s", key, e)
+    fname = str(d.get("file") or "")
+    if fname and CLIENT is not None:
+        try:
+            r = await CLIENT.call("get_image", {"file": fname}, 20)
+            payload = r.get("data") or {}
+            b64 = payload.get("base64") or (payload.get("data") or {}).get("base64") or ""
+            if b64:
+                return base64.b64decode(b64)
+            fp = str(payload.get("file") or payload.get("path") or "")
+            if fp and os.path.isfile(fp):
+                return Path(fp).read_bytes()
+        except Exception as e:
+            logger.warning("get_image 失败：%s", e)
+    return b""
+
+
+async def _save_images(data, limit: int = 3):
+    """把消息里的图片存到本地，返回路径列表。
+
+    后缀按**文件头**取，不按下载链接猜：表情存成 .jpg 就不动了，
+    而 QQ 给的链接常常连后缀都没有。
+    """
     paths = []
     segs = data.get("message")
     if not isinstance(segs, list):
         return paths
-    INBOX.mkdir(parents=True, exist_ok=True)
     for seg in segs:
-        if seg.get("type") != "image":
+        if len(paths) >= limit:
+            break
+        if not isinstance(seg, dict) or seg.get("type") != "image":
             continue
-        d = seg.get("data") or {}
-        url = d.get("url") or d.get("file")
-        if not url:
+        blob = await _image_bytes(seg)
+        if len(blob) <= 200:      # 太小基本是失败页/占位图
             continue
-        dest = INBOX / f"{int(time.time())}-{uuid.uuid4().hex[:6]}.jpg"
         try:
-            def _dl(u=url, p=dest):
-                with urllib.request.urlopen(u, timeout=20) as r, open(p, "wb") as f:
-                    f.write(r.read())
-            await asyncio.to_thread(_dl)
-            if dest.stat().st_size > 200:
-                paths.append(str(dest))
+            paths.append(str(vision_mod.save_bytes(blob, INBOX)))
         except Exception as e:
-            logger.warning("图片下载失败: %s", e)
+            logger.warning("图片落盘失败：%s", e)
     return paths
+
+
+async def _image_notes(paths, question: str = "", allow_vision: bool = False) -> str:
+    """把几张图变成几行「图里有什么」，交给模型。
+
+    认得出字就只给字（本地 OCR，免费，0.1-0.5 秒）；字太少才考虑请视觉模型
+    看一眼（要花钱、要代理，所以只有主人的图才允许走）。
+    """
+    if not paths or not VISION_ENABLED:
+        return ""
+    lines = []
+    for p in paths[:3]:
+        try:
+            kind, text = await asyncio.to_thread(VISION.look, p, question, allow_vision)
+        except Exception as e:
+            logger.warning("看图失败：%s", e)
+            kind, text = "", ""
+        lines.append(vision_mod.note_text(kind, text, p))
+    return "\n".join(lines)
+
+
+async def _ocr_only(data, limit: int = 1) -> str:
+    """公开通道专用：只读图里的字（本地 OCR，免费），绝不调用视觉模型。
+
+    认不出字就当没收到图 —— 不然群里每个表情包都要回一句；给陌生人的图花钱、
+    还把图传给外部 API，这两条都不该发生。
+    """
+    if not VISION_ENABLED:
+        return ""
+    try:
+        imgs = await _save_images(data, limit=limit)
+    except Exception as e:
+        logger.warning("图片落盘失败：%s", e)
+        return ""
+    for p in imgs[:limit]:
+        try:
+            kind, got = await asyncio.to_thread(VISION.look, p, "", False)
+        except Exception as e:
+            logger.warning("OCR 失败：%s", e)
+            continue
+        if kind == "text" and got:
+            return vision_mod.note_text(kind, got)
+    return ""
 
 
 async def _voice_audio(seg: dict):
@@ -2407,12 +2975,14 @@ async def _merge_flush():
     await _handle_owner_text(merged, data, uid, has_images=False, reply_to=reply_to)
 
 
-async def _merge_append(text: str, data, uid: int, has_images: bool = False, reply_to: str = ""):
+async def _merge_append(text: str, data, uid: int, has_images: bool = False, reply_to: str = "",
+                        image_note: str = ""):
     """主人私聊的入口。命令 / shell / 图片不参与合并，先把攒好的发出去再立刻处理。"""
-    instant = text.startswith(("/", "!")) or has_images
+    instant = text.startswith(("/", "!")) or has_images or bool(image_note)
     if instant:
         await _merge_flush()
-        await _handle_owner_text(text, data, uid, has_images=has_images, reply_to=reply_to)
+        await _handle_owner_text(text, data, uid, has_images=has_images, reply_to=reply_to,
+                                 image_note=image_note)
         return
     flush_now = False
     delay = 0.0
@@ -2436,7 +3006,7 @@ async def _merge_append(text: str, data, uid: int, has_images: bool = False, rep
 
 
 async def _handle_owner_text(text: str, data, uid: int, has_images: bool = False,
-                             reply_to: str = ""):
+                             reply_to: str = "", image_note: str = ""):
     """主人私聊的正文处理：命令 → 分流 → 入队。原来 on_message 的后半段。"""
     log(f"收到：{text[:300]}")
     # 主人私聊也留一份本地记录，重启/换会话后能靠它接上
@@ -2446,6 +3016,9 @@ async def _handle_owner_text(text: str, data, uid: int, has_images: bool = False
         await submit_shell(text, "qq")
         return
     if await handle_command(text):
+        return
+    # 「换成 deepseek」这类自然语言也当切换命令处理，别交给闲聊模型去编
+    if await _maybe_switch_model_by_text(text):
         return
 
     # 显式指定通道：/执行 强制当任务，/聊 强制当闲聊
@@ -2471,7 +3044,9 @@ async def _handle_owner_text(text: str, data, uid: int, has_images: bool = False
     elif profile == "full":
         kind, why = "task", "完整工具集"
     else:
-        kind, why = classify(text, has_images=has_images)
+        # 图已经变成文字了，就没必要再走重通道（claude.exe 一句三万多 token）；
+        # 只有"一个字都没读出来"时才保留 has_images → 任务，让模型自己 Read 原图。
+        kind, why = classify(text, has_images=has_images and not image_note)
     log(f"分流：{kind}（{why}）")
 
     # 引用回复：明确告诉模型"这句是对我上一条说的"，而不是让它从乱码里猜。
@@ -2492,6 +3067,10 @@ async def _handle_owner_text(text: str, data, uid: int, has_images: bool = False
     # message_id 做幂等键：NapCat 重连后可能重投同一条消息
     mid = data.get("message_id")
     dedup = f"qq:{mid}" if mid is not None else None
+    # 看图结果附在正文后面（而不是混进正文里）：命令解析要用干净的原话，
+    # 模型却需要知道图里有什么。放这儿正好两边都满足。
+    if image_note:
+        text = (text + "\n\n" + image_note).strip()
     res = await submit_task(text, "qq", dedup_key=dedup, sender=str(uid), kind=kind,
                             profile=profile)
     status = res.get("status")
@@ -2569,23 +3148,22 @@ async def on_message(data):
         isinstance(s, dict) and s.get("type") == "image" for s in _segs))
     for m in ([] if structured_img else re.finditer(r"\[CQ:image,([^\]]+)\]", text)):
         kv = dict(x.split("=", 1) for x in m.group(1).split(",") if "=" in x)
-        url = (kv.get("url") or kv.get("file") or "").replace("&amp;", "&")
-        if url:
-            try:
-                import urllib.request
-                INBOX.mkdir(parents=True, exist_ok=True)
-                dest = INBOX / f"{int(time.time())}-{uuid.uuid4().hex[:6]}.jpg"
-                with urllib.request.urlopen(url, timeout=20) as r, open(dest, "wb") as f:
-                    f.write(r.read())
-                if dest.stat().st_size > 200:
-                    imgs.append(str(dest))
-            except Exception as e:
-                logger.warning("CQ 图片下载失败: %s", e)
+        blob = await _image_bytes({"data": kv})
+        if len(blob) <= 200:
+            continue
+        try:
+            imgs.append(str(vision_mod.save_bytes(blob, INBOX)))
+        except Exception as e:
+            logger.warning("CQ 图片落盘失败: %s", e)
+    # 图片 → 文字。主人的图允许走视觉模型（花钱，有每小时上限）；OCR 认出字就不花。
+    # 这一步放在合并之前：带图的消息本来就不参与合并（见 _merge_append）。
+    image_note = ""
     if imgs:
         text = re.sub(r"\[CQ:image,[^\]]+\]", "", text).strip()
-    if imgs:
-        note = "（主人发来的图片，请先用 Read 工具查看：" + "；".join(imgs) + "）"
-        text = (text + chr(10) * 2 + note) if text else note
+        PENDING_IMAGES.update(paths=list(imgs), at=time.time())
+        image_note = await _image_notes(
+            imgs, question=text, allow_vision=bool(getattr(VISION, "owner_vision", True)))
+        log(f"收到 {len(imgs)} 张图，看图结果 {len(image_note)} 字")
     # 语音转出来的话就当成他说的话：带标记，模型才知道这不是打字
     if voice_lines:
         spoken = "\n".join(f"[语音转文字] {v}" for v in voice_lines)
@@ -2593,11 +3171,15 @@ async def on_message(data):
     elif had_voice and not text:
         # 转不出来时给个明确的占位，别让模型以为对方发了空白消息
         text = "[语音，没能转成文字]"
+    if not text and imgs:
+        # 只发图不说话：给个占位，别让这条消息消失在 if not text 里
+        text = "（发了张图）"
     if not text:
         return
 
     # 连发的几句话先攒成一条再处理（攒法见 _merge_append）
-    await _merge_append(text, data, uid, has_images=bool(imgs), reply_to=reply_to)
+    await _merge_append(text, data, uid, has_images=bool(imgs), reply_to=reply_to,
+                        image_note=image_note)
 
 
 SEEN_FLAGS = {}
@@ -2789,6 +3371,16 @@ async def main():
     log(f"任务通道：profile={TASK_PROFILE} 工具={TASK_TOOLS} "
         f"MCP={TASK_MCP_MODE} max_turns={TASK_MAX_TURNS}；/完整 可临时放开")
     log(f"表情库：{len(STICKERS)} 张（{STICKER_DIR}）")
+    # 看图：OCR 助手是常驻 PowerShell 子进程，冷启动要 4 秒左右（实测），
+    # 在这里预热掉，第一条图片才不用等。视觉模型不预热（一次调用 20 秒、要花钱）。
+    if VISION_ENABLED:
+        asyncio.create_task(asyncio.to_thread(VISION.warm))
+        _vst = VISION.status()
+        log(f"看图：OCR 引擎{'可用，后台预热中' if _vst['ocr'] else '不可用（系统缺 OCR 语言包？）'}；"
+            f"视觉模型 {'可用' if _vst['vision'] else '未配置'}"
+            f"（每小时上限 {_vst['hour_cap']} 张，只给主人的图）")
+    else:
+        log("看图：关着（config.json 的 vision.enabled）")
     try:
         _pending_reminders = len(RSTORE.pending())
         if _pending_reminders:

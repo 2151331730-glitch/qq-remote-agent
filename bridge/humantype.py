@@ -116,8 +116,41 @@ def humanize(text: str, keep_exclaim: bool = True) -> str:
     return t.strip()
 
 
+# 链接里自带 ? & # = ，句末断点会把它们当成句子结束，一条链接被劈成两条就点不开了。
+# 切之前先换成占位符（私有区字符，正常文本里不会出现），切完再还原。
+_URL = re.compile(r"https?://[^\s一-鿿，。！？；：、）】》\"']+")
+_URL_PH = re.compile("(\\d+)")
+
+
+def _protect_urls(text: str) -> tuple[str, list[str]]:
+    urls: list[str] = []
+
+    def rep(m):
+        urls.append(m.group(0))
+        return f"{len(urls) - 1}"
+
+    return _URL.sub(rep, text), urls
+
+
+def _restore_urls(text: str, urls: list[str]) -> str:
+    if not urls:
+        return text
+    return _URL_PH.sub(lambda m: urls[int(m.group(1))], text)
+
+
 def split_like_human(text: str, max_parts: int = 2, soft_limit: int = 60,
                      join_below: int = 26):
+    """把回复切成真人会发的那种 1~2 条。
+
+    链接先保护起来再切（见 `_protect_urls`）：含 ? 的链接被切开等于把人坑了。
+    """
+    raw, urls = _protect_urls((text or "").strip())
+    parts = _split_parts(raw, max_parts, soft_limit, join_below)
+    return [_restore_urls(p, urls) for p in parts]
+
+
+def _split_parts(raw: str, max_parts: int = 2, soft_limit: int = 60,
+                 join_below: int = 26):
     """把回复切成真人会发的那种 1~2 条。
 
     实测真人 84% 只发一条、13% 发两条、只有 2% 发三条以上。所以：
@@ -128,7 +161,6 @@ def split_like_human(text: str, max_parts: int = 2, soft_limit: int = 60,
     2. **最多 2 条**。三条以上是明显的机器特征，多出来的并进第二条。
     3. 只有单条真的超过 `soft_limit`（约 60 字，已到真人 p100 之上）才切。
     """
-    raw = (text or "").strip()
     if not raw:
         return []
 
@@ -163,6 +195,103 @@ def split_like_human(text: str, max_parts: int = 2, soft_limit: int = 60,
             best, idx = d, i + 1
     a, b = "".join(chunks[:idx]).strip(), "".join(chunks[idx:]).strip()
     return [x for x in (a, b) if x]
+
+
+# ---------------- 防复读：看它最近说了什么 ----------------
+# 模型的坏习惯是「模仿自己的历史」：连着三条都用「行」开头，或者每条都以反问收尾。
+# 这些提示词管不住，得把最近几条拿出来算一算，动态塞回系统提示。
+
+_CLAUSE_SEP = re.compile(r"[，,。！？!?~…\s、：:；;]")
+_PUNCT = re.compile(r"[，,。！？!?~…\s、：:；;　]+")
+
+
+def _said(history, n: int = 5) -> list[str]:
+    out = [str(m.get("content") or "") for m in (history or [])
+           if str(m.get("role") or "") == "assistant"]
+    return [x for x in out if x.strip()][-n:]
+
+
+def opener(text: str) -> str:
+    """第一条小句的头 4 个字，用来判断开头是不是在复读。"""
+    t = _PUNCT.sub(" ", (text or "").strip()).strip()
+    if not t:
+        return ""
+    return _CLAUSE_SEP.split(t, 1)[0][:4]
+
+
+def is_question(text: str) -> bool:
+    """中文口语里问句常常不带问号（「咋了」「那算啥」），两种都要认。"""
+    t = (text or "").strip().rstrip("～~。.，, ")
+    if not t:
+        return False
+    if t.endswith("？") or t.endswith("?"):
+        return True
+    if t.endswith(("吗", "呢")):
+        return True
+    if any(w in t for w in ("咋了", "咋回事", "是不是")):
+        return True
+    return t[:3].startswith(("怎么", "为什么", "啥", "哪", "谁", "咋"))
+
+
+def _norm(text: str) -> str:
+    return _PUNCT.sub("", text or "")
+
+
+def _bigrams(text: str) -> set[str]:
+    t = _norm(text)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def is_repeat(reply: str, prev: list[str], threshold: float = 0.65) -> bool:
+    """这句是不是跟刚才说过的某句几乎一样（复读机）。"""
+    r = _norm(reply)
+    if not r:
+        return False
+    for p in prev[-3:]:
+        pn = _norm(p)
+        if pn and r == pn:          # 一字不差地复读，短句也算
+            return True
+    if len(r) < 8:
+        return False
+    rb = _bigrams(reply)
+    if not rb:
+        return False
+    for p in prev[-3:]:
+        pn = _norm(p)
+        if not pn:
+            continue
+        if r == pn:
+            return True
+        pb = _bigrams(p)
+        if not pb:
+            continue
+        sim = len(rb & pb) / len(rb | pb)
+        if sim >= threshold:
+            return True
+    return False
+
+
+def style_note(history, window: int = 3) -> str:
+    """根据最近几条，给这次生成加一句"别这样"的提醒。没有毛病就返回空串。"""
+    said = _said(history, window + 1)
+    if not said:
+        return ""
+    recent = said[-window:]
+    hints = []
+
+    ops = [opener(x) for x in recent]
+    if len(ops) >= 2 and ops and all(o and o == ops[-1] for o in ops):
+        hints.append(f"开头别再是「{ops[-1]}」，前面连着用了")
+    if len(recent) >= 2 and all(is_question(x) for x in recent):
+        hints.append("你连着几条都在反问，这条别提问，直接给反应或看法")
+    lens = [len(_norm(x)) for x in recent]
+    if lens and sum(lens) / len(lens) > 24:
+        hints.append("最近几条偏长，这条压到 15 字以内")
+    if any(w in "".join(recent[-2:]) for w in ("模型", "AI", "助手", "提示词", "人设")):
+        hints.append("别再聊你自己是什么模型或程序，也别为上一句道歉")
+    if not hints:
+        return ""
+    return "（这次注意：" + "；".join(hints) + "。自然接下句，不用解释为什么）"
 
 
 def typing_delay(before_chars: int, first: bool = False) -> float:

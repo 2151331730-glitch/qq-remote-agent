@@ -354,6 +354,17 @@ class RedisStore:
                 d["last_error"] = (error or "")[:300]
                 self.r.hset(self._k("outbox"), oid, json.dumps(d, ensure_ascii=False))
 
+    def outbox_drop(self, oid, error=None):
+        """标记已处理、不再补发（闲聊这类时效内容，见 store.py 同名方法）。"""
+        self.r.zrem(self._k("outbox:pending"), str(oid))
+        raw = self.r.hget(self._k("outbox"), oid)
+        if raw:
+            d = json.loads(raw)
+            d["attempts"] = d.get("attempts", 0) + 1
+            d["delivered_at"] = time.time()
+            d["last_error"] = (error or "")[:300]
+            self.r.hset(self._k("outbox"), oid, json.dumps(d, ensure_ascii=False))
+
     def outbox_pending_count(self):
         return int(self.r.zcard(self._k("outbox:pending")))
 
@@ -408,6 +419,7 @@ def _pct(vals, p):
 # 统一给公开方法加上"主库挂了就重新发现"的重连逻辑（放类外批量套，避免二十个装饰器）
 for _name in ("enqueue", "claim_next", "finish", "requeue", "cancel", "cancel_all_queued",
               "recover_interrupted", "get", "queue_depth", "recent", "stats", "events",
-              "daily", "outbox_add", "outbox_pending", "outbox_mark", "outbox_pending_count",
+              "daily", "outbox_add", "outbox_pending", "outbox_mark", "outbox_drop",
+              "outbox_pending_count",
               "count_since", "tokens_since", "prune"):
     setattr(RedisStore, _name, RedisStore._resilient(getattr(RedisStore, _name)))

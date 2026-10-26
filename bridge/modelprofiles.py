@@ -23,6 +23,7 @@ token 只在 `bee_credentials()` 的返回值里活一次，不打印、不落�
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -52,6 +53,49 @@ def canonical(name: str) -> str:
 def spec_for(name: str) -> dict | None:
     """档案名 → 配置。大小写不敏感、认别名，未知返回 None。"""
     return MODEL_PROFILES.get(canonical(name))
+
+
+# ---------------- 自然语言切模型 ----------------
+# 主人常直接说「你接的模型换成 deepseek」而不是发 /model。以前这种话会被当成闲聊，
+# 由模型自己回答——它没有切换工具，只能编一句「换不了，模型是平台定的」。
+# 这里只认「切换动词 + 已知模型名」同时出现的**短句**，把动作提到 bridge 层执行。
+SWITCH_VERBS = ("换成", "换到", "换成个", "切换成", "切换到", "切到", "切成",
+                "改成", "改为", "调成", "换回", "换个", "换一个", "切个")
+MODEL_WORDS = {"deepseek": "flash", "flash": "flash", "grok": "grok"}
+
+_DS_WORD = re.compile(r"(?<![a-z])ds(?![a-z])")
+
+
+def detect_switch_request(text: str) -> str | None:
+    """一句话 → 要切的档案名；只说「换个模型」却没给目标 → "hint"；不像在切模型 → None。
+
+    两条护栏，避免把「换成 deepseek 写的代码再跑一遍」这种活当成切换：
+    · 整句不超过 30 字；
+    · 模型名必须落在句尾（允许后面跟「模型」和语气词）。
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 30:
+        return None
+    low = t.lower()
+    has_verb = any(v in t for v in SWITCH_VERBS)
+
+    # 去掉句尾语气词和「模型」二字，再看模型名是不是就在结尾附近
+    tail = low.rstrip("。！!？?，,吧啊呗呀了哦呢 ")
+    tail = re.sub(r"(的)?模型$", "", tail).rstrip("。！!？?，,吧啊呗呀了哦呢 ")
+    tail_window = tail[-12:]
+
+    target = None
+    for word, profile in MODEL_WORDS.items():
+        if word in tail_window:
+            target = profile
+            break
+    if target is None and _DS_WORD.search(tail_window):
+        target = "flash"
+    if target and has_verb:
+        return target
+    if target is None and "模型" in t and (has_verb or "换" in t or "切" in t):
+        return "hint"
+    return None
 
 
 def bee_credentials(settings_path) -> dict:

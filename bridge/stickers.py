@@ -26,6 +26,20 @@ EXTS = (".gif", ".png", ".jpg", ".jpeg", ".webp")
 STICKER_RE = re.compile(r"@@\s*表情\s*[:：]\s*([^@\n]{1,20}?)\s*@@")
 
 
+# 模型偶尔把标记写歪：全角冒号、少一个 @、写成「贴纸 / 收藏」。正常写法在
+# extract() 里就摘掉了，这里刮的是**漏网的残渣**——它们会原样发到手机上，
+# 比不发还难看。宁可这次不发图，也不能让「@@表情:猫猫@@」当文字发出去。
+_SCRUB = re.compile(
+    r"@@\s*(?:表情|贴纸|收藏|sticker)\s*[:：]?[^@\n]{0,20}@@"
+    r"|@_\s*(?:表情|贴纸|收藏)[^_\n]{0,20}@_",
+    re.I)
+
+
+def scrub(text: str) -> str:
+    """把漏网的表情标记整段刮掉，返回干净文本。"""
+    return _SCRUB.sub("", str(text or "")).strip()
+
+
 def extract(text: str):
     """从回复里摘出 (剩下的话, 表情名或空串)。一条回复最多一张。"""
     raw = str(text or "")
@@ -34,6 +48,42 @@ def extract(text: str):
         return raw, ""
     # count=1：只摘第一张，多写的标记原样留着（人能看见，也方便发现模型在滥用）
     return STICKER_RE.sub("", raw, count=1).strip(), m.group(1).strip()
+
+
+def clean_name(name, max_len: int = 12) -> str:
+    """把用户给的名字收拾成能当文件名的样子。
+
+    为什么要管：名字最后会拼进 `STICKER_DIR / f"{名字}{后缀}"`，
+    带 `/`、`\\`、`..` 的名字能写到表情库外面去。太长也会让菜单糊成一团。
+    """
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]', "", str(name or "")).strip().strip(".")
+    return s[:max_len]
+
+
+def pick_save_source(paths, at: float, now: float, ttl: float = 120) -> str:
+    """挑出"可以存成表情"的那张图；没有就返回空串。
+
+    两道条件缺一不可：图还在磁盘上，而且**刚发的**（default 120 秒内）。
+    没有时效限制的话，早上发的截图会在晚上被当成表情存进去。
+    """
+    if not paths or (now - float(at or 0)) > ttl:
+        return ""
+    for p in reversed(list(paths)):
+        if p and Path(p).is_file():
+            return str(p)
+    return ""
+
+
+def rules_text(menu: str, public: bool = False) -> str:
+    """提示词里的表情说明书。菜单空着就返回空串——别教它写一个发不出去的标记。"""
+    if not menu:
+        return ""
+    tail = "群里更别刷表情，一条顶天了。" if public else ""
+    return ("（你手里有这些 QQ 表情，格式是 名字=它的样子：" + menu + "\n"
+            "想发表情就在回复最后单独一行写 @@表情:名字@@，系统会把它摘掉、单独发一张。\n"
+            "一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，"
+            "跟人发微信一个样。别同一个连着用。"
+            "表情经常比文字更贴，只有一两句话的时候尤其适合。" + tail + "）")
 
 
 class StickerBook:

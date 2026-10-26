@@ -49,6 +49,19 @@ from pathlib import Path
 # 单轮对话上下文的硬上限：超过就丢最旧的一半。够聊很久，又不至于无限增长。
 MAX_CONTEXT_TURNS = 60
 
+# 单条历史的字数上限。历史是按条数封顶的（history_turns×2 条），
+# 所以只要有一条超长（贴了个文档、一张报错全文），它就会一直占着重额 token。
+# 600 字足够容纳正常对话，也让「一条超长」不会挤掉后面十几轮的上下文。
+HISTORY_ENTRY_MAX = 600
+
+
+def _cap_entry(text: str) -> str:
+    """单条历史截断：超长时留头部（信息量在开头），末尾加省略号。"""
+    t = (text or "").strip()
+    if len(t) <= HISTORY_ENTRY_MAX:
+        return t
+    return t[:HISTORY_ENTRY_MAX].rstrip() + "…"
+
 # 垫底上下文的过滤：这些不是"对话"，塞进去只会污染语感
 _NOISE = re.compile(
     r"^[/!]|"                          # 斜杠命令 / shell 命令
@@ -220,7 +233,7 @@ class DirectChat:
         if not (text or "").strip():
             return
         h = self.history_for(scope)
-        h.append({"role": role, "content": text.strip()})
+        h.append({"role": role, "content": _cap_entry(text)})
         self._touched = True
         # 硬上限：一问一答算 2 条，超过就把最旧的丢掉一半
         cap = min(self.history_turns * 2, MAX_CONTEXT_TURNS * 2)
@@ -281,18 +294,52 @@ class DirectChat:
 
     # ---------------- 调用 ----------------
 
-    def ask(self, scope: str, text: str, system: str, on_delta=None) -> tuple[str, bool]:
+    def replace_last_assistant(self, scope: str, text: str):
+        """把历史里最后一条 assistant 换成真正发出去的那版。
+
+        模型会模仿自己的历史：历史里存着带句号、分三行的原稿，下一句它就接着那么写。
+        实际发到 QQ 上的是 humanize + 分条之后的版本，历史里也该是那一版。
+        """
+        h = self.history_for(scope)
+        text = (text or "").strip()
+        if text and h and h[-1].get("role") == "assistant":
+            h[-1]["content"] = text
+            self._touched = True
+
+    def ask(self, scope: str, text: str, system: str, on_delta=None,
+            guide: str = "", retry: bool = False) -> tuple[str, bool]:
         """发一句话，返回 (回复文本, 成功?)。失败时返回 ("", False)，错误在 last_error。
 
         on_delta(chunk) 会在流式返回时被逐段调用，用来边生成边吐到 QQ。
+        `guide` 只对这一次请求生效（拼在 system 后面），不会写进历史——
+        重试时用「换个说法」「别反问」这类提醒，不能弄脏对话记录。
+        `retry=True` 表示这次是重写上一版：先把上一条 assistant 撤下来，
+        失败的恢复原样，成功的用新回复替换，历史里始终只有一问一答。
         """
         self.last_error = ""
         if not self.available():
             self.last_error = "直连未配置"
             return "", False
 
-        self.add_turn(scope, "user", text)
-        msgs = [dict(m) for m in self.history_for(scope)]
+        h = self.history_for(scope)
+        dropped = None
+        if retry:
+            if h and h[-1].get("role") == "assistant":
+                dropped = h.pop()
+        else:
+            self.add_turn(scope, "user", text)
+
+        def _restore():
+            hh = self.history_for(scope)
+            if retry:
+                if dropped is not None:
+                    hh.append(dropped)
+            elif hh:
+                hh.pop()                 # 失败就把这句话撤回，别污染上下文
+            self._touched = True
+            self.save()
+
+        msgs = [dict(m) for m in h]
         # 相邻同角色合并（历史里可能有连续的 user）
         merged: list[dict] = []
         for m in msgs:
@@ -310,8 +357,11 @@ class DirectChat:
             "max_tokens": self.max_tokens,
             "messages": merged,
         }
-        if system:
-            payload["system"] = system
+        sys_text = (system or "").strip()
+        if guide:
+            sys_text = (sys_text + "\n\n" + guide).strip()
+        if sys_text:
+            payload["system"] = sys_text
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if self.stream and on_delta:
@@ -347,26 +397,17 @@ class DirectChat:
             except Exception:
                 pass
             self.last_error = f"HTTP {e.code} {detail}"
-            if self.history_for(scope):
-                self.history_for(scope).pop()      # 失败就把这句话撤回，别污染上下文
-                self._touched = True
-                self.save()
+            _restore()
             return "", False
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
-            if self.history_for(scope):
-                self.history_for(scope).pop()
-                self._touched = True
-                self.save()
+            _restore()
             return "", False
 
         reply = (reply or "").strip()
         if not reply:
             self.last_error = "空回复"
-            if self.history_for(scope):
-                self.history_for(scope).pop()
-                self._touched = True
-                self.save()
+            _restore()
             return "", False
         self.add_turn(scope, "assistant", reply)
         self.save()                    # 一问一答落盘，重启后接得上

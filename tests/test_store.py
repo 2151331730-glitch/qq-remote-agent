@@ -156,6 +156,14 @@ def test_outbox_failure_keeps_pending(store):
     assert len(pend) == 1 and pend[0]["attempts"] == 1
 
 
+def test_outbox_drop_never_replays(store):
+    """闲聊回复即使没发出去也不再补发：补发走 raw send()，会绕过 humanize。"""
+    oid = store.outbox_add("旧闲聊", None)
+    store.outbox_drop(oid, "chat send failed")
+    assert store.outbox_pending(10) == []
+    assert store.outbox_pending_count() == 0
+
+
 def test_count_and_tokens_since(store):
     tid, _ = store.enqueue("x")
     store.claim_next()

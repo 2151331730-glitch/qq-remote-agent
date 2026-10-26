@@ -117,3 +117,28 @@ def test_state_save_creates_parent(tmp_path):
     p = tmp_path / "deep" / "dir" / "model_state.json"
     assert mp.save_state(p, "flash", "", "default") is True
     assert p.exists()
+
+
+# ---------------- 自然语言切换（2026-10-26） ----------------
+
+def test_detect_natural_language_switch():
+    assert mp.detect_switch_request("换成deepseek") == "flash"
+    assert mp.detect_switch_request("你接的模型换成deepseek") == "flash"
+    assert mp.detect_switch_request("怎么切换到 DeepSeek") == "flash"
+    assert mp.detect_switch_request("换回flash吧") == "flash"
+    assert mp.detect_switch_request("换一个grok模型") == "grok"
+
+
+def test_detect_hint_without_target():
+    assert mp.detect_switch_request("换个模型") == "hint"
+    assert mp.detect_switch_request("切模型") == "hint"
+
+
+def test_detect_ignores_normal_chat():
+    assert mp.detect_switch_request("你现在是什么模型") is None
+    assert mp.detect_switch_request("deepseek 和 gpt 哪个好") is None
+    assert mp.detect_switch_request("") is None
+    # 模型名在句首、后面还跟着活 → 不是切模型
+    assert mp.detect_switch_request("换成deepseek写的代码再跑一遍") is None
+    # 太长的一句话不认
+    assert mp.detect_switch_request("你现在这个模型回答太慢了能不能换成deepseek然后把这个脚本再跑一遍看看结果") is None
