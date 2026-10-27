@@ -501,3 +501,67 @@ def test_replace_last_assistant_stores_delivered_text(monkeypatch):
     c.replace_last_assistant("owner", "行，那我看看")
     assert c.history_for("owner")[-1]["content"] == "行，那我看看"
     c.replace_last_assistant("nobody", "x")     # 空会话不炸
+
+
+# ---------------- 历史总字数预算（2026-10-27）----------------
+# 背景：条数封顶挡不住"20 条长消息"。真正决定每次说话贵不贵的是总字数，
+# 所以 ask() 在发出去之前还会按预算从最旧的一端再砍一刀。
+
+def test_trim_budget_keeps_short_conversation():
+    msgs = [{"role": "user", "content": "在吗"},
+            {"role": "assistant", "content": "在"},
+            {"role": "user", "content": "干嘛呢"}]
+    assert direct.trim_budget(msgs, 100) == msgs
+
+
+def test_trim_budget_drops_from_the_oldest_end():
+    msgs = [{"role": "user", "content": "老" * 50},
+            {"role": "assistant", "content": "答" * 50},
+            {"role": "user", "content": "新" * 10}]
+    out = direct.trim_budget(msgs, 60)
+    assert out[-1]["content"] == "新" * 10
+    assert sum(len(m["content"]) for m in out) <= 60
+
+
+def test_trim_budget_never_drops_the_last_message():
+    # 这一条就是对方刚说的话，砍掉等于问了个空问题
+    msgs = [{"role": "user", "content": "x" * 5000}]
+    out = direct.trim_budget(msgs, 10)
+    assert len(out) == 1 and out[0]["content"] == "x" * 5000
+
+
+def test_trim_budget_starts_with_user():
+    # 砍完可能正好落在 assistant 上；Anthropic 要求第一条必须是 user
+    msgs = [{"role": "user", "content": "u" * 10},
+            {"role": "assistant", "content": "a" * 10},
+            {"role": "user", "content": "u" * 10},
+            {"role": "assistant", "content": "a" * 10},
+            {"role": "user", "content": "u" * 10}]
+    out = direct.trim_budget(msgs, 20)
+    assert out[0]["role"] == "user"
+    assert out[-1]["role"] == "user"
+
+
+def test_trim_budget_does_not_mutate_input():
+    msgs = [{"role": "user", "content": "a" * 100},
+            {"role": "user", "content": "b" * 10}]
+    direct.trim_budget(msgs, 20)
+    assert len(msgs) == 2
+
+
+def test_ask_sends_at_most_the_char_budget(monkeypatch):
+    c = direct.DirectChat({"enabled": True, "base_url": "https://x.invalid",
+                           "api_key": "k", "stream": False,
+                           "history_turns": 20, "history_max_chars": 120})
+    sent = []
+
+    def fake_urlopen(req, timeout=None):
+        sent.append(json.loads(req.data.decode("utf-8")))
+        return _fake_response("好", stream=False)
+    monkeypatch.setattr(direct.urllib.request, "urlopen", fake_urlopen)
+
+    for i in range(10):
+        c.ask("owner", f"第{i}句" + "啊" * 100, "S")
+    total = sum(len(m["content"]) for m in sent[-1]["messages"])
+    assert total <= 300          # 120 预算 + 这次新消息本身
+    assert sent[-1]["messages"][-1]["content"].startswith("第9句")

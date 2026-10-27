@@ -62,6 +62,32 @@ def _cap_entry(text: str) -> str:
         return t
     return t[:HISTORY_ENTRY_MAX].rstrip() + "…"
 
+
+def trim_budget(msgs: list, budget: int) -> list:
+    """按「历史总字数」再砍一刀，从最旧的一端砍起。
+
+    为什么按字数而不只按条数：条数相同，内容可以是 20 字也可以是 12000 字，
+    而计费按 token（大约等于字数）。真正决定每次说话贵不贵的，是这个总量。
+
+    规则：
+    - 最后一条（这次的新消息）无论如何保留；
+    - 砍完如果开头是 assistant，一并丢掉——Anthropic 要求第一条是 user；
+    - 不改原 list，返回新 list（调用方还要拿原历史回滚）。
+    """
+    if not msgs:
+        return []
+    if budget <= 0:
+        return list(msgs)
+    total = sum(len(str(m.get("content") or "")) for m in msgs)
+    start = 0
+    while total > budget and len(msgs) - start > 1:
+        total -= len(str(msgs[start].get("content") or ""))
+        start += 1
+    out = [dict(m) for m in msgs[start:]]
+    while len(out) > 1 and out[0].get("role") != "user":
+        out.pop(0)
+    return out
+
 # 垫底上下文的过滤：这些不是"对话"，塞进去只会污染语感
 _NOISE = re.compile(
     r"^[/!]|"                          # 斜杠命令 / shell 命令
@@ -124,6 +150,8 @@ class DirectChat:
         self.max_tokens = int(cfg.get("max_tokens", 400))
         self.temperature = float(cfg.get("temperature", 1.0))
         self.history_turns = int(cfg.get("history_turns", 20))
+        # 历史总字数预算：条数封顶之外的第二道闸，防止"20 条长消息"把每次调用撑大
+        self.history_max_chars = int(cfg.get("history_max_chars", 1500))
         self.timeout = int(cfg.get("timeout_seconds", 60))
         self.stream = bool(cfg.get("stream", True))
         # 走代理时才建 opener：DeepSeek 国内直连，套代理只会多一跳
@@ -307,7 +335,8 @@ class DirectChat:
             self._touched = True
 
     def ask(self, scope: str, text: str, system: str, on_delta=None,
-            guide: str = "", retry: bool = False) -> tuple[str, bool]:
+            guide: str = "", retry: bool = False,
+            store_user: bool = True) -> tuple[str, bool]:
         """发一句话，返回 (回复文本, 成功?)。失败时返回 ("", False)，错误在 last_error。
 
         on_delta(chunk) 会在流式返回时被逐段调用，用来边生成边吐到 QQ。
@@ -315,6 +344,9 @@ class DirectChat:
         重试时用「换个说法」「别反问」这类提醒，不能弄脏对话记录。
         `retry=True` 表示这次是重写上一版：先把上一条 assistant 撤下来，
         失败的恢复原样，成功的用新回复替换，历史里始终只有一问一答。
+        `store_user=False` 表示这条 user 内容只是这次的由头（主动开口时那句
+        "系统提示"），**不进历史**：否则下一轮它会当成对方说过的话去模仿。
+        这次的回复仍然进历史，因为它确实发出去了。
         """
         self.last_error = ""
         if not self.available():
@@ -326,7 +358,7 @@ class DirectChat:
         if retry:
             if h and h[-1].get("role") == "assistant":
                 dropped = h.pop()
-        else:
+        elif store_user:
             self.add_turn(scope, "user", text)
 
         def _restore():
@@ -334,7 +366,7 @@ class DirectChat:
             if retry:
                 if dropped is not None:
                     hh.append(dropped)
-            elif hh:
+            elif store_user and hh:
                 hh.pop()                 # 失败就把这句话撤回，别污染上下文
             self._touched = True
             self.save()
@@ -351,6 +383,8 @@ class DirectChat:
             merged.append({"role": "user", "content": text})
         if merged[0]["role"] != "user":
             merged.pop(0)
+        # 最后一道闸：按总字数再砍一次（只影响这一次请求，不动磁盘上的历史）
+        merged = trim_budget(merged, self.history_max_chars)
 
         payload = {
             "model": self.model,

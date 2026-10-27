@@ -26,8 +26,17 @@
   "task_prompt_template": "（手机 QQ 发来的任务，直接在本机执行）{task}\n做完用纯文本给一句结论，别用 Markdown 标题和表格。",
   "show_footer": false,
   "reminder_check_seconds": 20,
+  "proactive": {
+    "enabled": true,
+    "idle_minutes": 240,
+    "jitter_minutes": 60,
+    "min_gap_minutes": 180,
+    "max_per_day": 2,
+    "quiet_hours": "23-9",
+    "check_seconds": 60
+  },
   "public_chat": true,
-  "public_max_per_hour": 20,
+  "public_max_per_hour": 40,
   "public_cooldown_seconds": 5,
   "public_max_reply_chars": 400,
   "public_max_input_chars": 1000,
@@ -37,8 +46,27 @@
   "group_policy": "mention",
   "group_policy_overrides": {},
   "group_min_chars": 4,
-  "group_after_speak_seconds": 45,
+  "group_after_speak_seconds": 25,
   "group_skip_at_other": true,
+  "group_level": 1,
+  "group_keywords": [
+    "小南"
+  ],
+  "group_level_probability": 0.15,
+  "group_level_overrides": {},
+  "group_whitelist": [],
+  "public_private": false,
+  "friend_whitelist": [],
+  "group_batch": {
+    "enabled": true,
+    "idle_ms": 9000,
+    "called_ms": 4000,
+    "max_wait_ms": 30000,
+    "step_ms": 1500,
+    "max_lines": 15,
+    "cooldown_override_lines": 3,
+    "max_per_hour": 40
+  },
   "public_system_prompt": "",
   "public_persona_path": "",
   "context_enabled": true,
@@ -70,6 +98,7 @@
   "sticker_dir": "",
   "voice": {
     "enabled": true,
+    "group_all": true,
     "port": 18791,
     "model": "small",
     "language": "zh",
@@ -80,13 +109,21 @@
   "tts": {
     "enabled": true,
     "engine": "auto",
+    "volc": {
+      "enabled": true,
+      "voice": "zh_female_xiaohe_uranus_bigtts",
+      "resource_id": "seed-tts-2.0",
+      "speed_ratio": 1.0,
+      "secret_file": ""
+    },
+    "allow_public": false,
     "sapi_voice": "Microsoft Huihui Desktop",
     "edge_voice": "zh-CN-XiaoxiaoNeural",
     "edge_rate": "+0%",
     "rate": 0,
-    "proxy": "http://127.0.0.1:7892",
     "timeout_seconds": 30,
     "max_chars": 200,
+    "proxy": "http://127.0.0.1:7892",
     "cache_dir": ""
   },
   "qzone": {
@@ -125,9 +162,15 @@
     "proxy": "",
     "max_tokens": 400,
     "temperature": 1.0,
-    "history_turns": 20,
+    "history_turns": 8,
     "timeout_seconds": 60,
     "stream": true,
-    "history_path": ""
+    "history_path": "",
+    "history_max_chars": 1200
+  },
+  "stickers": {
+    "auto_learn": true,
+    "max": 200,
+    "per_minute": 3
   }
 }

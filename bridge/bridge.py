@@ -36,6 +36,7 @@ import rules
 import context as context_mod
 import history
 import policy
+import proactive as proactive_mod
 import chatstyle
 import humantype
 import modelprofiles
@@ -122,6 +123,9 @@ EMPTY_MCP_PATH = Path(CFG.get("empty_mcp_path") or (BASE / "tmp" / "empty-mcp.js
 # ---- 语音消息：QQ 语音 → 本地 faster-whisper → 文字 ----
 VOICE_CFG = dict(CFG.get("voice") or {})
 VOICE_ENABLED = bool(VOICE_CFG.get("enabled", True))
+# 群里默认连没被 @ 的语音也转（本地识别不花钱，只是占一会儿 CPU）。
+# 群多/语音多的场合把它改成 false，就退回"只转被 @ 的"。
+GROUP_VOICE_ALL = bool(VOICE_CFG.get("group_all", True))
 VOICE = voice_mod.Voice(VOICE_CFG)
 # ---- 连发合并：主人一句话分几段发时，攒起来当一条处理 ----
 MERGE_BASE_MS = int(CFG.get("owner_merge_ms", 3500))
@@ -130,10 +134,21 @@ MERGE_MAX_LINES = int(CFG.get("owner_merge_max_lines", 6))
 # ---- 表情：模型输出 @@表情:名字@@ 时单独发一条「表情」而不是大图 ----
 STICKER_DIR = Path(CFG.get("sticker_dir") or (BASE / "stickers"))
 STICKERS = sticker_mod.StickerBook(STICKER_DIR)
+# 在群里"学"表情：别人发的商城表情 / 表情图，自动存进库，之后自己也能发。
+# 商城表情在协议里其实是以 image 段下发的（带 emoji_id 和 gxh.vip.qq.com 的直链），
+# 所以下载下来就是一张普通的 gif —— 不用碰商城 ID 那套，稳定得多。
+STICKER_CFG = dict(CFG.get("stickers") or {})
+STICKER_AUTO_LEARN = bool(STICKER_CFG.get("auto_learn", True))
+STICKER_MAX = int(STICKER_CFG.get("max", 200))          # 库里最多这么多张
+STICKER_LEARN_LIMIT = int(STICKER_CFG.get("per_minute", 3))   # 每分钟最多收几张
+_LEARN = {"at": 0.0, "n": 0}
 # ---- 语音条：文字 → TTS（edge-tts 优先、SAPI 兜底）→ QQ record ----
 # 和 voice.py 是**反方向**的两件事：voice.py 把收到的语音转成文字（STT），
 # 这里把要说的话转成语音（TTS）。两个配置段也分开：voice / tts。
-TTS = tts_mod.TTS(dict(CFG.get("tts") or {}))
+TTS_CFG = dict(CFG.get("tts") or {})
+TTS = tts_mod.TTS(TTS_CFG)
+# 群里也让不让她发语音条（默认允许；嫌吵就改 tts.allow_public=false）
+TTS_ALLOW_PUBLIC = bool(TTS_CFG.get("allow_public", True))
 # ---- 看图：图片 → 文字（本地 OCR 免费；只有"图里没字"才请视觉模型，花钱）----
 # 为什么必须有这一层：闲聊走 DeepSeek 直连，只收文字；任务通道虽然有 Read，
 # 但把图片塞进上下文同样看不见内容。所以先在本地把图变成字，再喂给模型。
@@ -211,6 +226,103 @@ def sticker_rules(public: bool = False) -> str:
         pass
     menu = STICKERS.menu() if len(STICKERS) else ""
     return sticker_mod.rules_text(menu, public)
+
+
+def voice_rules(public: bool = False) -> str:
+    """提示词里的语音说明书。没开 TTS 就返回空串（别教它写一个发不出去的标记）。"""
+    if not TTS.available():
+        return ""
+    if public and not TTS_ALLOW_PUBLIC:
+        return ""
+    return tts_mod.rules_text(public)
+
+
+def _is_sticker_image(seg) -> bool:
+    """这张图算不算"表情"：商城表情带 emoji_id，普通表情图带 sub_type=1。"""
+    if not isinstance(seg, dict) or seg.get("type") != "image":
+        return False
+    d = seg.get("data") or {}
+    if str(d.get("emoji_id") or "").strip():
+        return True
+    try:
+        return int(d.get("sub_type") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _sticker_name(seg) -> str:
+    """从段里捞一个能当文件名的名字。商城表情的 summary 就是它自己的名字。"""
+    d = seg.get("data") or {}
+    nm = str(d.get("summary") or "").strip().strip("[]").strip()
+    eid = str(d.get("emoji_id") or "").strip()
+    if not nm or nm in ("表情", "图片", "动画表情", "商城表情"):
+        nm = f"表情{eid[-4:]}" if eid else "表情"
+    return sticker_mod.clean_name(nm) or "表情"
+
+
+def _learn_allowed() -> bool:
+    """一分钟的闸：群里表情刷屏时别把库塞爆、也别一直下文件。"""
+    now = time.time()
+    if now - _LEARN["at"] > 60:
+        _LEARN["at"], _LEARN["n"] = now, 0
+    if _LEARN["n"] >= STICKER_LEARN_LIMIT:
+        return False
+    if len(STICKERS) >= STICKER_MAX:
+        return False
+    return True
+
+
+async def _learn_stickers(data) -> int:
+    """别人发的表情 → 存进本地库。返回这次收了几张。
+
+    只在"看起来是表情"时才下载：商城表情（emoji_id）和 sub_type=1 的表情图。
+    普通截图不碰——不然群里发张作业截图也会被当表情收进来。
+    """
+    if not STICKER_AUTO_LEARN:
+        return 0
+    segs = data.get("message")
+    if not isinstance(segs, list):
+        segs = []
+    if not segs:
+        # 有的 NapCat 配置把图发成 CQ 码字符串，兜一层（结构化分段优先，防重复下载）
+        segs = [{"type": "image", "data": dict(
+                    x.split("=", 1) for x in m.group(1).split(",") if "=" in x)}
+                for m in re.finditer(r"\[CQ:image,([^\]]+)\]",
+                                     str(data.get("raw_message") or ""))]
+    got = 0
+    for seg in segs:
+        if got >= 2 or not _is_sticker_image(seg):
+            continue
+        if not _learn_allowed():
+            break
+        try:
+            blob = await _image_bytes(seg)
+        except Exception as e:
+            logger.warning("表情下载失败：%s", e)
+            continue
+        if len(blob) < 200:
+            continue
+        try:
+            path = sticker_mod.store(STICKER_DIR, _sticker_name(seg), blob)
+        except Exception as e:
+            logger.warning("表情入库失败：%s", e)
+            continue
+        if not path:
+            logger.warning("表情没入库：store 返回空（目录 %s，字节 %d）", STICKER_DIR, len(blob))
+            continue
+        _LEARN["n"] += 1
+        got += 1
+        try:
+            STICKERS.scan()
+        except Exception:
+            pass
+        # 落地校验：写成功不等于文件还在（目录被清、盘满、权限都会静默吃掉写入）。
+        # 少了这句日志，出问题时只能看到"学了一张"，却找不到文件。
+        if not Path(path).exists():
+            logger.warning("表情写完却不在：%s", path)
+            continue
+        log(f"学了一张表情：{path}")
+    return got
 
 
 def ensure_empty_mcp() -> str:
@@ -393,6 +505,25 @@ TASK_TEMPLATE = str(CFG.get("task_prompt_template") or CFG.get("prompt_template"
 SHOW_FOOTER = bool(CFG.get("show_footer", False))
 REMINDER_DB = Path(os.environ.get("QQ_REMOTE_REMINDERS") or (BASE / "reminders.db"))
 REMINDER_INTERVAL = int(CFG.get("reminder_check_seconds", 20))
+# 主动私聊：主人很久没说话时自己开个话头。判定是纯函数（proactive.py，有单测），
+# 状态落一个小 json；只走主人私聊的闲聊直连，不碰群、不碰任务通道。
+PROACTIVE_CFG = proactive_mod.normalize(dict(CFG.get("proactive") or {}))
+PROACTIVE_PATH = Path(os.environ.get("QQ_REMOTE_PROACTIVE")
+                      or CFG.get("proactive_path") or (BASE / "proactive_state.json"))
+PROACTIVE_STATE = proactive_mod.load(PROACTIVE_PATH)
+PROACTIVE_INTERVAL = max(10, int(PROACTIVE_CFG.get("check_seconds") or 60))
+
+
+def _proactive_cfg() -> dict:
+    """生效配置：state 里的开关压过 config.json。
+
+    为什么把开关放在 state 而不是写回 config.json：config.json 带 token，
+    `/主动 关` 每切一次就重写一遍有风险；开关是运行时偏好，和 model_state.json 同类。
+    """
+    c = dict(PROACTIVE_CFG)
+    if "enabled" in PROACTIVE_STATE:
+        c["enabled"] = bool(PROACTIVE_STATE["enabled"])
+    return c
 
 # ---- 公开聊天：非主人私聊 + 群聊 ----
 # 只陪聊，永远不碰工具；主人私聊才是唯一能操作电脑的通道
@@ -405,7 +536,8 @@ PUBLIC_MAX_PENDING = int(CFG.get("public_max_pending", 3))
 PUBLIC_WORKDIR = Path(CFG.get("public_workdir") or (BASE / "tmp" / "public"))
 # 群里只有 @ 机器人（或说这个前缀）才会回，避免刷屏
 GROUP_PREFIX = str(CFG.get("group_trigger_prefix") or "")
-# 接话策略：mention（只 @）/ open（全回）/ 0~1（没 @ 时按概率插一句，像真人）
+# 接话策略：mention（只 @）/ open（全回）/ 0~1（没 @ 时按概率插一句）
+# active（2026-10-26）：没 @ 也攒成一批交给模型，由它自己决定接不接
 GROUP_POLICY = CFG.get("group_policy", "mention")
 GROUP_POLICY_OVERRIDES = dict(CFG.get("group_policy_overrides") or {})
 GROUP_MIN_CHARS = int(CFG.get("group_min_chars", 4))
@@ -414,17 +546,85 @@ GROUP_MIN_CHARS = int(CFG.get("group_min_chars", 4))
 GROUP_AFTER_SPEAK = float(CFG.get("group_after_speak_seconds", 45))
 # 别人在跟别人说话（@ 了群里另一个人）：概率插话一律不接，抢话最不像人
 GROUP_SKIP_AT_OTHER = bool(CFG.get("group_skip_at_other", True))
+
+
+def _level_of(value):
+    """配置里的 group_level：没写 / 空 → None（表示"用老的 group_policy"）。
+
+    0 是合法档位，不能和"没配置"混为一谈，所以这里不能用 `int(... or 0)`。
+    """
+    if value is None or value == "":
+        return None
+    return policy.parse_level(value, default=1)
+
+
+# ---- 响应档位（2026-10-27，参考 QQ-agent 的"响应档位"）----
+# 和 group_policy 的区别：group_policy 是"抽样/攒批"，决定的是**怎么**接；
+# 档位决定的是"这条消息**值不值得**跑一次模型"。没过档的消息直接 return，
+# 一次模型调用都不会发生——省的是整次请求，而且不接话本身就不像机器人。
+GROUP_LEVEL = _level_of(CFG.get("group_level"))
+GROUP_LEVEL_OVERRIDES = dict(CFG.get("group_level_overrides") or {})
+GROUP_KEYWORDS = [str(k).strip() for k in (CFG.get("group_keywords") or [])
+                  if str(k).strip()]
+GROUP_LEVEL_PROB = float(CFG.get("group_level_probability", 0.15))
+# 白名单：空 = 不限。群白名单管"只在哪些群说话"，好友白名单管陌生人私聊。
+GROUP_WHITELIST = {str(x) for x in (CFG.get("group_whitelist") or [])}
+# 陌生人私聊总开关。默认关：不认识的号私聊过来一律不理（只记一行日志）。
+# 这是封号风险最高的一条路——对陌生人高频回复最容易被人举报。
+PUBLIC_PRIVATE = bool(CFG.get("public_private", False))
+FRIEND_WHITELIST = {str(x) for x in (CFG.get("friend_whitelist") or [])}
+_WL_LOGGED = set()          # 只记一次日志，免得被不在白名单的群刷屏
+
+# ---- 攒批（active 模式）----
+# 为什么不按概率抽样：抽掉的 90% 里可能正好是它想说的话题，抽中的又常常接不上。
+# 攒成一批一次问，模型看着上下文决定插哪句——调用次数反而更少（一批一次），
+# 但每条消息都被"看过"了。代价是延迟：没被叫时最多等 GROUP_BATCH_MAX_WAIT。
+_GROUP_BATCH_CFG = dict(CFG.get("group_batch") or {})
+GROUP_BATCH_ENABLED = bool(_GROUP_BATCH_CFG.get("enabled", True))
+GROUP_BATCH_IDLE_MS = int(_GROUP_BATCH_CFG.get("idle_ms", 9000))
+GROUP_BATCH_CALLED_MS = int(_GROUP_BATCH_CFG.get("called_ms", 4000))
+GROUP_BATCH_MAX_WAIT_MS = int(_GROUP_BATCH_CFG.get("max_wait_ms", 30000))
+GROUP_BATCH_STEP_MS = int(_GROUP_BATCH_CFG.get("step_ms", 1500))
+GROUP_BATCH_LINES = int(_GROUP_BATCH_CFG.get("max_lines", 15))
+GROUP_BATCH_OVERRIDE = int(_GROUP_BATCH_CFG.get("cooldown_override_lines", 3))
+# 一批一次调用，不设上限的话热闹的群会把额度烧光；代价是后面只能干看着
+GROUP_BATCH_MAX_PER_HOUR = int(_GROUP_BATCH_CFG.get("max_per_hour", 40))
+GROUP_BUFFERS = {}          # gid -> {"lines": [(名字, 话)], "task": Task, "first_at": 时间}
+GROUP_BATCH_STAMPS = []     # 攒批调用的时间戳，用来算每小时上限
+
 # 群聊提示词里的"没话说"出口。没有这句，模型只能硬凑一句废话。
 _PASS_RULE_DEFAULT = (
     "\n\n群里补充规则：\n"
     "- 这一条不需要你接、你也确实没话可说时，只回 PASS 三个字母，不要加任何解释。\n"
     "- 被 @ 了就正常回；别为了接话硬凑，接不上就不接。")
 GROUP_PASS_RULE = str(CFG.get("group_pass_rule") or _PASS_RULE_DEFAULT)
+# 攒批时多说两句：告诉它这不是"有人跟你说话"，而是一堆话里挑着接。
+# 少了这段，模型会逐条回答，像客服在批处理工单。
+_BATCH_RULE_DEFAULT = (
+    "\n\n这一条是群里刚攒起来的几句（每行一个人说的话），**没有人叫你**。\n"
+    "- 想接就接，只说你在乎的那个点，一句话；别逐条回答、别总结、别当主持人。\n"
+    "- 插不上、别人在聊他们自己的事、或者你开口也是废话，就只回 PASS 一个词。")
+GROUP_BATCH_RULE = str(CFG.get("group_batch_rule") or _BATCH_RULE_DEFAULT)
+# 群聊比私聊还要短（参考 qq-agent-plugins 的 docs/语气调校.md：写检查项，别写形容词）。
+# 顺带省钱：输出 token 才是每次说话最贵的那部分，少写一半就少付一半。
+_GROUP_STYLE_DEFAULT = (
+    "\n\n群里说话比私聊更短：一条 3~15 字，说完就停。"
+    "不解释原理、不总结、不分点、不用 Markdown、不说「首先」「总之」。"
+    "别人在聊他们自己的事，接不上就别接。")
+GROUP_STYLE_RULE = str(CFG.get("group_style_rule") or _GROUP_STYLE_DEFAULT)
 
 
 def group_policy_for(gid: int):
     raw = GROUP_POLICY_OVERRIDES.get(str(gid), GROUP_POLICY)
     return policy.parse_policy(raw)
+
+
+def group_level_for(gid: int):
+    """这个群生效的档位；没配 group_level 时返回 None（调用方退回老策略）。"""
+    if GROUP_LEVEL is None:
+        return None
+    raw = GROUP_LEVEL_OVERRIDES.get(str(gid), GROUP_LEVEL)
+    return policy.parse_level(raw, default=GROUP_LEVEL)
 # 公开聊天的人格/规则：优先读文件（可随时改，不必重启），再 config，最后用内置兜底
 PUBLIC_PERSONA_PATH = Path(CFG.get("public_persona_path") or (BASE / "public_persona.md"))
 PUBLIC_SYSTEM = str(CFG.get("public_system_prompt") or """你是一个 QQ 聊天机器人，正在和不是主人的网友聊天（可能是私聊，也可能是群聊）。
@@ -613,7 +813,29 @@ def reload_config() -> dict:
     g["GROUP_MIN_CHARS"] = int(CFG.get("group_min_chars", 4))
     g["GROUP_AFTER_SPEAK"] = float(CFG.get("group_after_speak_seconds", 45))
     g["GROUP_SKIP_AT_OTHER"] = bool(CFG.get("group_skip_at_other", True))
+    g["GROUP_LEVEL"] = _level_of(CFG.get("group_level"))
+    g["GROUP_LEVEL_OVERRIDES"] = dict(CFG.get("group_level_overrides") or {})
+    g["GROUP_KEYWORDS"] = [str(k).strip() for k in (CFG.get("group_keywords") or [])
+                           if str(k).strip()]
+    g["GROUP_LEVEL_PROB"] = float(CFG.get("group_level_probability", 0.15))
+    g["GROUP_WHITELIST"] = {str(x) for x in (CFG.get("group_whitelist") or [])}
+    g["PUBLIC_PRIVATE"] = bool(CFG.get("public_private", False))
+    g["FRIEND_WHITELIST"] = {str(x) for x in (CFG.get("friend_whitelist") or [])}
+    try:
+        _gb = dict(CFG.get("group_batch") or {})
+        g["GROUP_BATCH_ENABLED"] = bool(_gb.get("enabled", True))
+        g["GROUP_BATCH_IDLE_MS"] = int(_gb.get("idle_ms", 9000))
+        g["GROUP_BATCH_CALLED_MS"] = int(_gb.get("called_ms", 4000))
+        g["GROUP_BATCH_MAX_WAIT_MS"] = int(_gb.get("max_wait_ms", 30000))
+        g["GROUP_BATCH_STEP_MS"] = int(_gb.get("step_ms", 1500))
+        g["GROUP_BATCH_LINES"] = int(_gb.get("max_lines", 15))
+        g["GROUP_BATCH_OVERRIDE"] = int(_gb.get("cooldown_override_lines", 3))
+        g["GROUP_BATCH_MAX_PER_HOUR"] = int(_gb.get("max_per_hour", 40))
+    except Exception as e:
+        logger.warning("攒批配置重载失败：%s", e)
     g["GROUP_PASS_RULE"] = str(CFG.get("group_pass_rule") or _PASS_RULE_DEFAULT)
+    g["GROUP_BATCH_RULE"] = str(CFG.get("group_batch_rule") or _BATCH_RULE_DEFAULT)
+    g["GROUP_STYLE_RULE"] = str(CFG.get("group_style_rule") or _GROUP_STYLE_DEFAULT)
     g["PUBLIC_ENABLED"] = bool(CFG.get("public_chat", True))
     g["PUBLIC_MAX_PER_HOUR"] = int(CFG.get("public_max_per_hour", 20))
     g["PUBLIC_COOLDOWN"] = float(CFG.get("public_cooldown_seconds", 5))
@@ -658,6 +880,12 @@ def reload_config() -> dict:
         g["VISION_ENABLED"] = bool(g["VISION_CFG"].get("enabled", True))
     except Exception as e:
         logger.warning("看图配置重载失败：%s", e)
+    # 主动私聊也热重载：改静默时长/免打扰/次数上限不用重启
+    try:
+        g["PROACTIVE_CFG"] = proactive_mod.normalize(dict(CFG.get("proactive") or {}))
+        g["PROACTIVE_INTERVAL"] = max(10, int(g["PROACTIVE_CFG"].get("check_seconds") or 60))
+    except Exception as e:
+        logger.warning("主动私聊配置重载失败：%s", e)
     g["CHAT_TEMPLATE"] = str(CFG.get("chat_prompt_template") or "")
     g["TASK_TEMPLATE"] = str(
         CFG.get("task_prompt_template") or CFG.get("prompt_template")
@@ -1332,7 +1560,7 @@ async def _deliver_human(body: str, tid: str) -> tuple[bool, str]:
     text = humantype.humanize(body) or body
     # 漏网的表情标记（写成全角、少一个 @、写成「贴纸」）整段刮掉再发，
     # 绝不能让「@@表情:猫猫@@」当文字出现在手机上。
-    text = sticker_mod.scrub(text)
+    text = tts_mod.scrub(sticker_mod.scrub(text))
     # 学到的行为规则在这里生效：**发出前**用代码检查一遍，不靠模型自觉。
     # 这是「下次别这么说」真的管用的关键。
     text, fired = RULES.apply(text)
@@ -1393,6 +1621,9 @@ def _direct_system(history=None) -> str:
     tip = sticker_rules()
     if tip:
         parts.append(tip)
+    vtip = voice_rules()
+    if vtip:
+        parts.append(vtip)
     parts.append(ESCALATE_RULE)
     parts.append(_model_identity_note())
     # 动态提醒：最近几条如果在复读开头、连续反问、或者越长越啰嗦，就当场点出来。
@@ -1515,8 +1746,9 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
         return await _execute_claude_chat(row, WORKDIR)
 
     body = _plain(reply)
-    # 表情标记先摘出来：剩下的文字长度、去标点、学规则都按干净文本算
+    # 表情 / 语音标记先摘出来：剩下的文字长度、去标点、学规则都按干净文本算
     body, sticker_name = sticker_mod.extract(body)
+    body, voice_text = tts_mod.extract(body)
     STORE.finish(tid, "succeeded", result=body, exit_code=0, cost_usd=0.0,
                  duration_ms=int(seconds * 1000), tokens_in=tin, tokens_out=tout)
     METRICS.inc("qq_remote_tasks_total", {"state": "succeeded"})
@@ -1541,9 +1773,23 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
             DIRECT.replace_last_assistant(scope, sent_text)
         if from_qq:
             _record("owner", int(CFG.get("bot_uin") or 0), "我", sent_text or speak)
-    if sticker_name:
-        # 先说话再贴表情，跟真人顺序一致；表情没有文字也算回了话（不触发「没说出话来」）
+    if voice_text or sticker_name:
+        # 先说话再贴表情/发语音，跟真人顺序一致；只有表情或语音也算回了话
         await asyncio.sleep(random.uniform(0.4, 1.1))
+    if voice_text:
+        if await send_voice(voice_text):
+            if not speak:
+                DIRECT.replace_last_assistant(scope, voice_text)
+            if from_qq:
+                _record("owner", int(CFG.get("bot_uin") or 0), "我", f"[语音] {voice_text}")
+        elif not speak:
+            # 合成不出来就别让它的话凭空消失：退成文字发出去
+            sent_ok, sent_text = await _deliver_human(voice_text, tid)
+            if sent_text:
+                DIRECT.replace_last_assistant(scope, sent_text)
+            if from_qq:
+                _record("owner", int(CFG.get("bot_uin") or 0), "我", sent_text or voice_text)
+    if sticker_name:
         await send_sticker(sticker_name)
     if followup:
         # 模型决定这事得动电脑：立刻转成一条任务，结果另发
@@ -1554,7 +1800,7 @@ async def _execute_direct_chat(row, text: str, scope: str = "owner"):
                 await send("我看下")
         else:
             await send(f"想查一下但排不进去（{res.get('status')}），等会儿再问我。")
-    elif not speak and not sticker_name:
+    elif not speak and not sticker_name and not voice_text:
         await _deliver_human(_fallback_line(), tid)
     _cleanup(tid)
 
@@ -1755,7 +2001,7 @@ async def _send_bubbles(target_type: str, target_id: int, body: str) -> bool:
     body = humantype.humanize(body) or body
     # 表情标记在公开通道里没有发送能力，但 model 有时还是会写上来 —— 刮掉，
     # 免得「@@表情:猫猫@@」被当成普通文字发到群里。整条只有标记就干脆不发。
-    body = sticker_mod.scrub(body)
+    body = tts_mod.scrub(sticker_mod.scrub(body))
     if not body:
         return False
     parts = (humantype.split_like_human(body, max_parts=PUBLIC_BUBBLE_PARTS,
@@ -1856,7 +2102,7 @@ async def fetch_history(group_id=None, user_id=None) -> str:
 
 
 async def handle_public(scope: str, target_type: str, target_id: int, text: str,
-                        who: str = "", addressed: bool = False):
+                        who: str = "", addressed: bool = False, batched: bool = False):
     """公开聊天的一次问答：限流 → 串行执行（无工具）→ 发回原会话。
 
     addressed 只对群聊有意义：被 @ 时模型说 PASS 也算"必须应一声"；
@@ -1887,11 +2133,16 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
             user_id=target_id if target_type == "private" else None)
     prompt = PUBLIC_TEMPLATE.replace("{task}", text)
     if is_group:
-        prompt += GROUP_PASS_RULE
+        prompt += GROUP_STYLE_RULE + GROUP_PASS_RULE
+        if batched:
+            prompt += GROUP_BATCH_RULE
     # 表情说明书：库空着时是空串，等于这条能力不存在
     sticker_tip = sticker_rules(public=True)
     if sticker_tip:
         prompt += "\n\n" + sticker_tip
+    voice_tip = voice_rules(public=True)
+    if voice_tip:
+        prompt += "\n\n" + voice_tip
     reply, cost, tin, tout, err = "", 0.0, 0, 0, "ok"
     ok = False
     if PUBLIC_DIRECT and DIRECT.available():
@@ -1901,9 +2152,13 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
         try:
             sys_prompt = load_public_system() or PUBLIC_TEMPLATE
             if is_group:
-                sys_prompt += GROUP_PASS_RULE
+                sys_prompt += GROUP_STYLE_RULE + GROUP_PASS_RULE
+                if batched:
+                    sys_prompt += GROUP_BATCH_RULE
             if sticker_tip:
                 sys_prompt += "\n\n" + sticker_tip
+            if voice_tip:
+                sys_prompt += "\n\n" + voice_tip
             if not DIRECT.history_for(scope):
                 DIRECT.seed_history(scope, history_text)
             got, ok = await asyncio.to_thread(
@@ -1944,19 +2199,33 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
         reply = policy.pick_hello()
         log(f"被 @ 但模型 PASS，改回一句应声：{scope}")
 
-    # 表情标记先摘出来再发：跟主人私聊那条路一致（先说话，再单独贴一张）
+    # 表情 / 语音标记先摘出来再发：跟主人私聊那条路一致（先说话，再单独贴/发）
     body = _plain(reply or "").strip()
     body, sticker_name = sticker_mod.extract(body)
+    body, voice_text = tts_mod.extract(body)
+    if not TTS_ALLOW_PUBLIC:
+        voice_text = ""       # 公开通道不让发语音（tts.allow_public=false）
     body = (body or "").strip()[:PUBLIC_MAX_REPLY]
-    if not body and not sticker_name:
+    if not body and not sticker_name and not voice_text:
         body = _fallback_line(err)
     sent = False
     if body:
         sent = await _send_bubbles(target_type, target_id, body)
         _record(scope, int(CFG.get("bot_uin") or 0), "我", body)
+    if voice_text:
+        # 语音没有文字也算回了话，不然"只发了条语音"会被记成失败
+        if body:
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+        if await send_voice(voice_text, target_type, target_id):
+            sent = True
+            _record(scope, int(CFG.get("bot_uin") or 0), "我", f"[语音] {voice_text}")
+        elif not body:
+            # 合成失败又没文字：把这句话当文字发出去，别让对面收到空气
+            sent = await _send_bubbles(target_type, target_id, voice_text) or sent
+            _record(scope, int(CFG.get("bot_uin") or 0), "我", voice_text)
     if sticker_name:
         # 表情没有文字也算回了话，不然"只发了个表情"会被记成失败
-        if body:
+        if body or voice_text:
             await asyncio.sleep(random.uniform(0.4, 1.0))
         sent = await send_sticker(sticker_name, target_type, target_id) or sent
         _record(scope, int(CFG.get("bot_uin") or 0), "我", f"[表情:{sticker_name}]")
@@ -1969,6 +2238,15 @@ async def handle_public(scope: str, target_type: str, target_id: int, text: str,
 
 
 async def on_public_private(data, uid: int, text: str):
+    # 陌生人私聊闸门（2026-10-27）：默认**不回**。
+    # 为什么默认关：主动/高频回复陌生号是封号风险最高的一条路，而且每条都要花钱。
+    # 想放行某个朋友：把 uid 写进 config.json 的 friend_whitelist；
+    # 想恢复"谁都回"：public_private 改成 true。
+    if not PUBLIC_PRIVATE and str(uid) not in FRIEND_WHITELIST:
+        if uid not in _WL_LOGGED:
+            _WL_LOGGED.add(uid)
+            log(f"非主人私聊（public_private 关，忽略）：{uid}")
+        return
     text = re.sub(r"\[CQ:[^\]]+\]", "", text or "").strip()
     # 图里的字（本地 OCR，免费）照样能读：对方发张截图问"这是什么"很常见。
     # 只走 OCR，**不走视觉模型**——公开通道不给陌生人的图花钱，也不把图传给外部 API。
@@ -2002,6 +2280,95 @@ async def _group_hello(gid: int, uid: int):
     await send_to("group", gid, random.choice(["在呢", "嗯？咋了", "在的，说呗", "咋了"]))
 
 
+def _group_batch_gate(scope: str):
+    """攒批专用限流。返回 (放行?, 原因)。
+
+    为什么单独算：被 @ 的回话必须优先，不能让攒批把额度吃光；
+    攒批本身偏"探头看看"，多给一些额度才不会一热闹就整小时装死。
+    """
+    now = time.time()
+    fresh = [t for t in GROUP_BATCH_STAMPS if now - t < 3600]
+    GROUP_BATCH_STAMPS[:] = fresh
+    if len(fresh) >= GROUP_BATCH_MAX_PER_HOUR:
+        return False, "hourly"
+    allowed, why = public_gate(scope)
+    if not allowed:
+        return False, why
+    return True, ""
+
+
+def _group_buffer_cancel(gid: int):
+    buf = GROUP_BUFFERS.get(gid)
+    if not buf:
+        return
+    task = buf.get("task")
+    if task and not task.done():
+        task.cancel()
+    GROUP_BUFFERS.pop(gid, None)
+
+
+def _group_buffer_add(gid: int, name: str, text: str):
+    """把一条没被 @ 的群消息攒进 buffer，并（重新）排定什么时候拿去看。
+
+    重排而不是排队：新消息进来说明话还在继续，那就再等一个间隔，
+    否则每隔 9 秒就切一刀，看到的永远是半句话。
+    """
+    buf = GROUP_BUFFERS.setdefault(gid, {"lines": [], "task": None, "first_at": time.time()})
+    buf["lines"].append((name, text))
+    if len(buf["lines"]) > 50:               # 没人叫时无限攒下去会吃内存
+        buf["lines"] = buf["lines"][-50:]
+    task = buf.get("task")
+    if task and not task.done():
+        task.cancel()
+    elapsed_ms = (time.time() - buf["first_at"]) * 1000
+    wait_ms = policy.batch_wait_ms(len(buf["lines"]), called=False,
+                                   idle_ms=GROUP_BATCH_IDLE_MS,
+                                   called_ms=GROUP_BATCH_CALLED_MS,
+                                   max_wait_ms=GROUP_BATCH_MAX_WAIT_MS,
+                                   step_ms=GROUP_BATCH_STEP_MS)
+    wait_ms = max(600, min(wait_ms, GROUP_BATCH_MAX_WAIT_MS - elapsed_ms))
+    buf["task"] = asyncio.create_task(_group_flush_later(gid, wait_ms / 1000.0))
+
+
+async def _group_flush_later(gid: int, seconds: float):
+    await asyncio.sleep(max(0.0, seconds))
+    await _group_flush(gid)
+
+
+async def _group_flush(gid: int):
+    """攒够了就看一眼：交给模型判断接不接（回复 PASS 就不发）。"""
+    buf = GROUP_BUFFERS.get(gid)
+    if not buf or not buf["lines"]:
+        GROUP_BUFFERS.pop(gid, None)
+        return
+    scope = f"group:{gid}"
+    since = time.time() - PUBLIC_STATE["last"].get(scope, 0)
+    if not policy.batch_ready(buf["lines"], since, GROUP_AFTER_SPEAK, GROUP_BATCH_OVERRIDE):
+        # 冷却中：等冷却过了再看，**不能丢**——丢了就又变回按概率抽样了
+        buf["task"] = asyncio.create_task(
+            _group_flush_later(gid, max(1.0, GROUP_AFTER_SPEAK - since)))
+        log(f"群里刚说过话，这批（{len(buf['lines'])} 条）再等一会儿：{scope}")
+        return
+    allowed, why = _group_batch_gate(scope)
+    if not allowed:
+        if why in ("busy", "cooldown"):
+            buf["task"] = asyncio.create_task(_group_flush_later(gid, 3.0))
+            return
+        log(f"攒批被限流（{why}），丢掉这批：{scope}")
+        GROUP_BUFFERS.pop(gid, None)
+        METRICS.inc("qq_remote_public_total", {"result": "batch_" + why})
+        return
+    lines = buf["lines"][-GROUP_BATCH_LINES:]
+    GROUP_BUFFERS.pop(gid, None)
+    GROUP_BATCH_STAMPS.append(time.time())
+    body = "\n".join(f"{n}：{t}" for n, t in lines)
+    METRICS.inc("qq_remote_group_messages_total", {"addressed": "batch"})
+    log(f"群消息 [group:{gid}] 攒了 {len(lines)} 条拿去看：{lines[-1][1][:40]}")
+    await handle_public(scope, "group", gid, body,
+                        who=f"（群里刚在聊，{len(lines)} 条）",
+                        addressed=False, batched=True)
+
+
 async def on_group_message(data, self_id: int):
     if not PUBLIC_ENABLED:
         return
@@ -2009,55 +2376,111 @@ async def on_group_message(data, self_id: int):
     uid = int(data.get("user_id") or 0)
     if not gid or (self_id and uid == self_id):
         return
+    # 群白名单：配了名单就只在名单里的群说话。不进名单的群连记录都不写，
+    # 免得日志和上下文被无关的群塞满；只在第一次遇到时记一行，方便排查。
+    if GROUP_WHITELIST and str(gid) not in GROUP_WHITELIST:
+        if gid not in _WL_LOGGED:
+            _WL_LOGGED.add(gid)
+            log(f"群 {gid} 不在白名单（group_whitelist），忽略该群消息")
+        return
     text, at_me, at_other = _group_text(data, self_id)
     sender = data.get("sender") or {}
     name = sender.get("card") or sender.get("nickname") or str(uid)
     # 群里的闲聊也落盘：被 @ 的时候这些就是"前情"（只写本地，不花 token）
     if text:
         _record(f"group:{gid}", uid, name, text)
+    # 群里的表情包顺手学一张：别人发的商城表情/表情图 → 存进库，之后自己也能发
+    if _has_image(data):
+        await _learn_stickers(data)
 
     addressed = at_me
     if not addressed and GROUP_PREFIX and text.startswith(GROUP_PREFIX):
         addressed = True
         text = text[len(GROUP_PREFIX):].strip()
     policy_value = group_policy_for(gid)
+    level = group_level_for(gid)      # None = 没配档位，走老的 group_policy
     scope = f"group:{gid}"
+    if addressed:
+        # 被叫到了：先回它，攒着的那批没必要再问一遍（前情都在本地记录里）
+        _group_buffer_cancel(gid)
+    # 群里的语音：默认**一律转**，不要求 @（本地 faster-whisper，不花钱、不出网）。
+    # 以前这里只认文字段，语音段被 _group_text 当"文件"扔掉 → 空文本 →
+    # 发语音只会收到一句「在呢」，看着就是耳聋。
+    # 只有"别人在 @ 别人"的语音不转 —— 那种消息反正也不接，转了是白耗 CPU。
+    # 嫌吵/嫌占 CPU：config.json 里 voice.group_all 改成 false，就退回"只转被 @ 的"。
+    maybe_voice = addressed or (GROUP_VOICE_ALL and not (GROUP_SKIP_AT_OTHER and at_other))
+    if maybe_voice and not text:
+        lines = await _group_voice_lines(data)
+        if lines:
+            text = "\n".join(f"[语音转文字] {v}" for v in lines)
+            _record(scope, uid, name, text)
+            log(f"群语音转文字：{text[:80]}")
+        elif _has_record(data):
+            # 转不出来也给个占位：否则模型以为对方发了条空消息
+            text = "[语音，没能转成文字]"
     if not addressed:
-        # 概率插话：像真人那样偶尔接一句；太短的消息（"嗯""哈哈"）不凑热闹
-        if len(text) < GROUP_MIN_CHARS or not policy.should_reply(policy_value, False):
-            METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
-            return
-        # 别人在跟群里另一个人说话，别抢话
+        # 别人在跟群里另一个人说话，别抢话（两种策略都一样）
         if GROUP_SKIP_AT_OTHER and at_other:
             METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
             log(f"群消息 [group:{gid}] uid={uid} @ 了别人，不插话：{text[:40]}")
             return
+        # 太短的消息（"嗯""哈哈"）不值得为它跑一次模型
+        if len(text) < GROUP_MIN_CHARS:
+            METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
+            return
+        if level is not None:
+            # 档位模式：先判断"这条值不值得跑一次模型"。没过档 → 零调用，直接结束。
+            # 注意顺序：这一步必须在任何模型调用之前，否则钱已经花了，档位就白设。
+            if not policy.level_wants(level, False, text,
+                                      GROUP_KEYWORDS, GROUP_LEVEL_PROB):
+                METRICS.inc("qq_remote_group_messages_total", {"addressed": "gate"})
+                log(f"群消息 [group:{gid}] uid={uid} 没过档位（{level}）：{text[:40]}")
+                return
+            if level < 3 and GROUP_BATCH_ENABLED:
+                # 过了档也别立刻逐个回：攒一小批，一批只调一次模型
+                _group_buffer_add(gid, name, await _enrich_with_images(data, uid, text))
+                METRICS.inc("qq_remote_group_messages_total", {"addressed": "buffer"})
+                log(f"群消息 [group:{gid}] uid={uid} 过档（{level}）攒着：{text[:50]}")
+                return
+            # 最高档（每条都回）或攒批关掉：落到下面统一的冷却检查
+        else:
+            if policy_value == "active" and GROUP_BATCH_ENABLED:
+                # active：不抽样，攒批交给模型判断接不接（这是活跃度最高、也最像人的那条）
+                _group_buffer_add(gid, name, await _enrich_with_images(data, uid, text))
+                METRICS.inc("qq_remote_group_messages_total", {"addressed": "buffer"})
+                log(f"群消息 [group:{gid}] uid={uid} 攒着：{text[:50]}")
+                return
+            if not policy.should_reply(policy_value, False):
+                METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
+                return
         # 刚说完一句就退场：真人不会一句接一句地刷屏
         quiet = time.time() - PUBLIC_STATE["last"].get(scope, 0)
         if quiet < GROUP_AFTER_SPEAK:
             METRICS.inc("qq_remote_group_messages_total", {"addressed": "no"})
             log(f"群里刚说过话（{quiet:.0f}s 前），这次不接：{scope}")
             return
-        METRICS.inc("qq_remote_group_messages_total", {"addressed": "random"})
-        log(f"群消息 [group:{gid}] uid={uid} 概率插话（policy={policy_value}）：{text[:60]}")
+        METRICS.inc("qq_remote_group_messages_total",
+                    {"addressed": "level" if level is not None else "random"})
+        log(f"群消息 [group:{gid}] uid={uid} 接话（level={level} policy={policy_value}）：{text[:60]}")
     else:
         # 无论后面怎么处理，先留一行证据：排查"群消息到底有没有到桥"只看这句
         METRICS.inc("qq_remote_group_messages_total", {"addressed": "yes"})
         log(f"群消息 [group:{gid}] uid={uid} at={at_me} 文本={text[:60] or '（空）'}")
-    # 只发图、不说话的群消息：只有被 @ 时才读（而且只读字，不花钱）。
-    # 没被 @ 的图连 min_chars 那道闸都过不去，群里的表情包/截图不会换来一句评论。
-    image_note = ""
+    # 只发图、不说话的群消息：只有被 @ 时才读，读得出来才算一条消息。
+    # 读法见 _group_image_note：免费 OCR 打底，主人的图才允许动用视觉模型。
+    image_done = False
     if not text and addressed and _has_image(data):
-        image_note = await _ocr_only(data)
-        if image_note:
-            text = "（发了张图）"
-            log(f"群消息 [group:{gid}] 只发了图，读出了字：{image_note[:60]}")
+        note = await _group_image_note(data, uid)
+        if note:
+            text = "（发了张图）\n" + note
+            image_done = True
+            log(f"群消息 [group:{gid}] 只发了图，读出了：{note[:60]}")
     if not text:
         if addressed:
             await _group_hello(gid, uid)
         return
-    if image_note:
-        text = text + "\n\n" + image_note
+    if not image_done:
+        text = await _enrich_with_images(data, uid, text)
     # 群聊一律只陪聊：即使是主人，也不在群里执行任务（结果会公开可见）
     await handle_public(scope, "group", gid, text, who=f"{name}({uid})",
                         addressed=addressed)
@@ -2082,6 +2505,104 @@ async def reminder_loop():
         await asyncio.sleep(REMINDER_INTERVAL)
 
 
+# ---------------- 主动私聊 ----------------
+# 由头、时间窗、次数上限都是 proactive.py 里的纯函数；这里只负责
+# "判定 → 让模型开口 → 用闲聊那条路发出去"。
+# 三条硬边界：只发主人私聊、只用闲聊直连（不花任务通道的钱）、
+# 有任务在跑时绝不插话（他可能在等结果，这时候来一句闲话很烦）。
+
+def _proactive_touch():
+    """主人说了话：从现在重新计时。写盘失败不影响消息处理。"""
+    try:
+        proactive_mod.note_user(PROACTIVE_STATE, _proactive_cfg())
+        proactive_mod.save(PROACTIVE_PATH, PROACTIVE_STATE)
+    except Exception as e:
+        logger.warning("主动私聊状态写入失败：%s", e)
+
+
+def _proactive_postpone(minutes: float = 30.0):
+    """这次没生成出人话：往后挪一会儿再来，别每分钟撞一次模型。"""
+    PROACTIVE_STATE["next_at"] = time.time() + minutes * 60
+    proactive_mod.save(PROACTIVE_PATH, PROACTIVE_STATE)
+
+
+async def _proactive_tick(force: bool = False) -> tuple[bool, str]:
+    """尝试主动说一句。返回 (发出去没有, 一句话原因)。"""
+    st = PROACTIVE_STATE
+    cfg = _proactive_cfg()
+    now = time.time()
+    if not force:
+        ok, why = proactive_mod.due(now, st, cfg)
+        if not ok:
+            return False, why
+    if STATE.get("current_task"):
+        return False, "有任务在跑"
+    if CLIENT is None or not STATE["owner_uin"]:
+        return False, "没连上 QQ"
+    if not (OWNER_DIRECT and DIRECT.available()):
+        return False, "闲聊直连没配置（主动私聊只走这条路，不上任务通道）"
+
+    last_user = float(st.get("last_user") or 0)
+    elapsed = (now - last_user) / 60 if last_user else 0.0
+    scratch = proactive_mod.build_scratch(now, elapsed)
+    hist = DIRECT.history_for("owner")
+    prev_said = [str(m.get("content") or "") for m in hist
+                 if m.get("role") == "assistant"][-3:]
+    try:
+        # store_user=False：那句"由头"只是一次性的提示，不进历史
+        reply, ok = await asyncio.to_thread(
+            DIRECT.ask, "owner", scratch, _direct_system(hist),
+            None, "", False, False)
+    except Exception as e:
+        logger.exception("主动私聊生成异常")
+        _proactive_postpone()
+        return False, f"生成异常（{type(e).__name__}）"
+    if not ok:
+        log(f"主动私聊生成失败：{DIRECT.last_error}")
+        _proactive_postpone()
+        return False, f"生成失败（{DIRECT.last_error}）"
+
+    body = _plain(reply)
+    body, sticker_name = sticker_mod.extract(body)
+    body, voice_text = tts_mod.extract(body)
+    # 主动开口比回话更容易翻车：没内容、或者跟上一次说的一模一样，
+    # 这一轮就直接放弃，不重写——他不理你的时候，你硬挤第二句只会更假。
+    if not body or humantype.is_thin(body) or humantype.is_repeat(body, prev_said):
+        log(f"主动私聊这句不合格，跳过：{body[:24]}")
+        _proactive_postpone()
+        return False, "生成的话太敷衍或在复读"
+
+    sent_ok, sent_text = await _deliver_human(body, "proactive")
+    if sent_text:
+        DIRECT.replace_last_assistant("owner", sent_text)
+    _record("owner", int(CFG.get("bot_uin") or 0), "我", sent_text or body)
+    if voice_text:
+        await send_voice(voice_text)
+    if sticker_name:
+        await send_sticker(sticker_name)
+    # 发没发成功都算"说过这一句"：否则 NapCat 断线时会每分钟重试一次
+    proactive_mod.note_sent(st, cfg, now)
+    proactive_mod.save(PROACTIVE_PATH, st)
+    METRICS.inc("qq_remote_proactive_total", {"result": "sent" if sent_ok else "failed"})
+    log(f"主动私聊{'发出' if sent_ok else '失败'}：{(sent_text or body)[:60]}"
+        f"（今天第 {st.get('count')} 次）")
+    return sent_ok, ""
+
+
+async def proactive_loop():
+    """每 PROACTIVE_INTERVAL 秒问一次"该不该开口"。
+
+    判定只是一串时间比较，便宜；真正调模型的只有判定通过的那一次。
+    """
+    await asyncio.sleep(30)      # 启动瞬间先让连接和聊天记录就位
+    while True:
+        try:
+            await _proactive_tick()
+        except Exception:
+            logger.exception("主动私聊巡检出错")
+        await asyncio.sleep(PROACTIVE_INTERVAL)
+
+
 # ---------------- 命令 ----------------
 
 HELP = """命令（只列常用的，其余见 /帮助 全部）：
@@ -2093,9 +2614,11 @@ HELP = """命令（只列常用的，其余见 /帮助 全部）：
 /记忆   看记住了什么（/忘 <关键词> 删掉）
 /提醒 20:30 交作业   到点提醒
 /提醒列表   看还没到点的
+/主动   主动私聊的状态（/主动 关 开 现在）
 /重载   改完 config.json 不用重启
 /学   重新学一遍聊天记录（更新说话风格），可以常发
 /完整 <事>   这条任务放开全部工具和 MCP（默认只有六个工具、不加载 MCP）
+/读 <路径>   直接把本机文件内容发回来（给目录就列目录，可加行号如 20-60）
 /model grok   换闲聊模型（grok / flash），任务永远 DeepSeek 不受影响
 /语音 <文本>   把这句话发成语音条（不带文本 = 把上一句再说一遍）
 /存表情 <名字>   把刚发的图存成表情（120 秒内有效）
@@ -2239,6 +2762,145 @@ async def _handle_save_sticker(name: str) -> None:
                f"发它：/发表情 {nm}　或者直接跟我说「来个{nm}」")
 
 
+# ---------- /读：把本机文件的内容直接发回来 ----------
+
+FILE_MAX_CHARS = 6000      # 一次最多回传这么多字符（send 会再按 chunk_size 切段）
+FILE_PREVIEW_LINES = 120   # 没给行号时，超长文件默认发前多少行
+FILE_LIST_MAX = 60         # 目录最多列多少项
+FILE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _resolve_local(raw: str) -> Path:
+    """把用户写的路径变成 Path：展开 ~ 和 %VAR%，相对路径按 /cd 的工作目录算。"""
+    s = raw.strip().strip('"').strip("'").strip()
+    s = os.path.expandvars(os.path.expanduser(s))
+    p = Path(s)
+    if not p.is_absolute():
+        p = Path(STATE.get("cwd") or WORKDIR) / p
+    return p
+
+
+def _split_line_range(s: str):
+    """从 `路径 10-50` / `路径:10-50` / `路径 10` 里切出行号；切不出返回 None。"""
+    for pat in (r"^(.+?)\s+(\d+)\s*(?:[-~至,]\s*(\d+))?$",
+                r"^(.+):(\d+)\s*(?:[-~至,]\s*(\d+))?$"):
+        m = re.match(pat, s)
+        if m:
+            return m.group(1), int(m.group(2)), int(m.group(3) or m.group(2))
+    return None
+
+
+def _decode_text(data: bytes):
+    """按 UTF-8 → GBK → UTF-16 试解码。
+
+    为什么不能只试 UTF-8：Windows 上中文文本有相当一部分是 GBK 存的（记事本老默认），
+    直接按 UTF-8 读会 UnicodeDecodeError，然后整个命令就报错了。
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        order = ("utf-16", "utf-8-sig", "gbk")
+    else:
+        order = ("utf-8-sig", "gbk", "utf-16")
+    for enc in order:
+        try:
+            return data.decode(enc), enc
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8（有坏字节）"
+
+
+async def _handle_read_file(arg: str) -> None:
+    """`/读 <路径> [起-止]`：不经过模型，直接把文件内容发回 QQ。
+
+    为什么不交给任务通道：任务通道要起 claude.exe，一次固定开销三万多 token，
+    只是为了看几十行文件太浪费；而且它回的是"摘要"，不是原文，想逐行核对时没用。
+    """
+    s = (arg or "").strip()
+    if not s:
+        await send("用法：/读 <路径> [起-止]\n"
+                   "例：/读 E:\\digitalself\\Project\\EVALS.md\n"
+                   "　　/读 笔记.md 20-60　（相对路径按 /cd 的工作目录算）\n"
+                   "　　/读 C:\\Users\\win11　（给目录就列目录）")
+        return
+
+    # 路径里可能有空格，所以先整串当路径试，不像路径才去切尾部的行号
+    rng = None
+    path_part = s
+    if not _resolve_local(s).exists():
+        got = _split_line_range(s)
+        if got:
+            path_part = got[0]
+            rng = (got[1], got[2])
+
+    p = _resolve_local(path_part)
+    if not p.exists():
+        await send(f"找不到：{p}\n（相对路径是按当前工作目录算的，/状态 可以看它）")
+        return
+
+    if p.is_dir():
+        try:
+            items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except Exception as e:
+            await send(f"列不出来：{e}")
+            return
+        shown = items[:FILE_LIST_MAX]
+        body = "\n".join(("📁 " if it.is_dir() else "📄 ") + it.name for it in shown)
+        tail = "" if len(items) <= FILE_LIST_MAX else f"\n…还有 {len(items) - FILE_LIST_MAX} 项"
+        await send(f"📁 {p}（{len(items)} 项）\n{body}{tail}\n\n"
+                   f"看文件内容：/读 <完整路径>")
+        return
+
+    try:
+        size = p.stat().st_size
+        if size > FILE_MAX_BYTES:
+            await send(f"{p.name} 有 {size // 1024 // 1024} MB，/读 只用来发文本。")
+            return
+        data = p.read_bytes()
+    except Exception as e:
+        await send(f"读不了：{e}")
+        return
+
+    # 二进制判定：文本文件里不会出现 NUL 字节（UTF-16 除外，它有 BOM，前面已排除）
+    if b"\x00" in data[:8192] and data[:2] not in (b"\xff\xfe", b"\xfe\xff"):
+        await send(f"{p.name} 像是二进制文件（{len(data) // 1024} KB），当文本发没有意义。")
+        return
+
+    text, enc = _decode_text(data)
+    lines = text.splitlines()
+    total = len(lines)
+    if total == 0:
+        await send(f"📄 {p.name} 是空文件（{enc}）。")
+        return
+
+    start, end = rng if rng else (1, min(total, FILE_PREVIEW_LINES))
+    start = max(1, min(start, total))
+    end = max(start, min(end, total))
+    body = "\n".join(lines[start - 1:end])
+    clipped = False
+    if len(body) > FILE_MAX_CHARS:
+        body = body[:FILE_MAX_CHARS]
+        cut = body.rfind("\n")
+        if cut > FILE_MAX_CHARS * 0.6:
+            body = body[:cut]
+        clipped = True
+
+    head = f"📄 {p.name}　共 {total} 行　{len(data) / 1024:.1f} KB　{enc}"
+    if start != 1 or end != total or clipped:
+        head += f"\n显示第 {start}-{end} 行"
+    msg = head + "\n" + "─" * 12 + "\n" + body
+
+    tips = []
+    hint_path = path_part.strip().strip('"').strip("'")
+    quoted = f'"{hint_path}"' if " " in hint_path else hint_path
+    if clipped:
+        tips.append("这段太长被截断了，用行号分段看")
+    elif end < total:
+        nxt = min(total, end + FILE_PREVIEW_LINES)
+        tips.append(f"还有 {total - end} 行；接着看：/读 {quoted} {end + 1}-{nxt}")
+    if tips:
+        msg += "\n" + "─" * 12 + "\n" + "\n".join(tips)
+    await send(msg)
+
+
 async def handle_command(text: str) -> bool:
     t = text.strip()
     low = t.lower()
@@ -2344,6 +3006,37 @@ async def handle_command(text: str) -> bool:
             return True
         log(f"新增记忆：{content[:80]}")
         await send(f"🧠 记住了：{content}")
+        return True
+
+    if low in ("/主动", "/proactive") or low.startswith("/主动 "):
+        _parts = t.split(maxsplit=1)
+        arg = _parts[1].strip().lower() if len(_parts) > 1 else ""
+        if arg in ("开", "on"):
+            PROACTIVE_STATE["enabled"] = True
+            proactive_mod.save(PROACTIVE_PATH, PROACTIVE_STATE)
+            await send("✅ 主动私聊开了。（下次静默够久我会先开口）")
+            return True
+        if arg in ("关", "off"):
+            PROACTIVE_STATE["enabled"] = False
+            proactive_mod.save(PROACTIVE_PATH, PROACTIVE_STATE)
+            await send("🔕 关了，不主动找你了。想开回来发 /主动 开")
+            return True
+        if arg in ("现在", "试", "test"):
+            ok, why = await _proactive_tick(force=True)
+            await send("✅ 发了" if ok else f"没发出去：{why}")
+            return True
+        now = time.time()
+        cfg = _proactive_cfg()
+        will, why = proactive_mod.due(now, PROACTIVE_STATE, cfg)
+        nxt = float(PROACTIVE_STATE.get("next_at") or 0)
+        nxt_txt = time.strftime("%m-%d %H:%M", time.localtime(nxt)) if nxt else "还没排上"
+        await send(
+            f"🤖 主动私聊：{'开' if cfg.get('enabled') else '关'}"
+            f"（静默 {cfg['idle_minutes']} 分钟后考虑，每天最多 {cfg['max_per_day']} 次，"
+            f"免打扰 {cfg['quiet_hours']}）\n"
+            f"今天已主动 {PROACTIVE_STATE.get('count') or 0} 次；最早下次 {nxt_txt}\n"
+            f"现在：{'会发' if will else '不发（' + why + '）'}\n"
+            f"/主动 关｜/主动 开｜/主动 现在（马上试一次）")
         return True
 
     if low in ("/提醒列表", "/提醒", "/reminders", "/reminder"):
@@ -2607,6 +3300,11 @@ async def handle_command(text: str) -> bool:
             await send("（上次结果不到 3000 字，已经完整发过了）")
         return True
 
+    if low in ("/读", "/read") or low.startswith("/读 ") or low.startswith("/read "):
+        parts = t.split(maxsplit=1)
+        await _handle_read_file(parts[1] if len(parts) > 1 else "")
+        return True
+
     if low.startswith("/cd "):
         target = t[4:].strip().strip('"')
         p = Path(target)
@@ -2750,6 +3448,18 @@ def _has_image(data) -> bool:
     return bool(re.search(r"\[CQ:image,", str(data.get("raw_message") or "")))
 
 
+_DIRECT_OPENER = None
+
+
+def _direct_opener():
+    """不走系统代理的 opener。QQ 图床都是国内域名，直连最快也最稳。"""
+    global _DIRECT_OPENER
+    if _DIRECT_OPENER is None:
+        import urllib.request as _u
+        _DIRECT_OPENER = _u.build_opener(_u.ProxyHandler({}))
+    return _DIRECT_OPENER
+
+
 async def _image_bytes(seg) -> bytes:
     """一个 image 段 → 图片字节。三条来源依次试，全失败返回空。
 
@@ -2772,8 +3482,20 @@ async def _image_bytes(seg) -> bytes:
             continue
         try:
             def _dl(x=u):
-                with urllib.request.urlopen(x, timeout=20) as r:
-                    return r.read()
+                # 先**绕开代理**直连：QQ 的图床（multimedia.nt.qq.com、gxh.vip.qq.com）
+                # 都是国内 CDN，走 Pigeon 反而被拒（实测 system proxy 下 10061 拒绝）。
+                # 直连不通再退回系统代理，兼容外网链接。
+                last = None
+                for opener in (_direct_opener(), None):
+                    try:
+                        if opener is None:
+                            with urllib.request.urlopen(x, timeout=20) as r:
+                                return r.read()
+                        with opener.open(x, timeout=20) as r:
+                            return r.read()
+                    except Exception as e:      # noqa: PERF203 - 两条来源都要试
+                        last = e
+                raise last
             blob = await asyncio.to_thread(_dl)
             if blob:
                 return blob
@@ -2863,6 +3585,65 @@ async def _ocr_only(data, limit: int = 1) -> str:
     return ""
 
 
+def _any_sticker(data) -> bool:
+    """这条消息里有没有表情图（商城表情带 emoji_id，普通表情图带 sub_type=1）。"""
+    segs = data.get("message")
+    if isinstance(segs, list):
+        return any(_is_sticker_image(s) for s in segs if isinstance(s, dict))
+    return bool(re.search(r"\[CQ:image,[^\]]*sub_type=1", str(data.get("raw_message") or "")))
+
+
+STICKER_QUESTION = ("这是一张表情包，不是普通照片。说清它想表达什么：画面是什么、"
+                    "配上对方这句话是什么情绪或梗。一两句中文，别罗列，别客套。")
+
+
+async def _group_image_note(data, uid, text: str = "", limit: int = 2) -> str:
+    """群里的图 → 几行「图里有什么」。两档，和公开通道的老规矩保持一致：
+
+    ① 字：本地 OCR，免费、离线、不上传，所有人都享受；
+    ② 内容：视觉模型，花钱、图要出网，所以**只有主人的图**才允许
+       （`vision.owner_vision`），且只在 OCR 一个字都没读出来时才调
+       （照片、表情包正好都是这种）。
+
+    为什么要有这一步：`_group_text()` 把 image 段整个丢掉，主人发张表情问
+    「谁看懂了」时，模型手里只有那行字，只能干瞪眼。
+    """
+    if not VISION_ENABLED:
+        return ""
+    try:
+        imgs = await _save_images(data, limit=limit)
+    except Exception as e:
+        logger.warning("群图片落盘失败：%s", e)
+        return ""
+    if not imgs:
+        return ""
+    sticker = _any_sticker(data)
+    question = STICKER_QUESTION if sticker else str(text or "").strip()
+    allow = bool(VISION.owner_vision) and int(uid or 0) == int(STATE.get("owner_uin") or 0)
+    lines = []
+    for p in imgs[:limit]:
+        try:
+            kind, got = await asyncio.to_thread(VISION.look, p, question, allow)
+        except Exception as e:
+            logger.warning("群图片识别失败：%s", e)
+            continue
+        if not kind or not got:
+            continue
+        lines.append(vision_mod.note_text(kind, got))
+        log(f"群图片识别（{kind}{'，视觉模型' if kind == 'see' else '，OCR'}）：{str(got)[:60]}")
+    return "\n".join(lines)
+
+
+async def _enrich_with_images(data, uid, text: str) -> str:
+    """有图就把识别结果接到正文后面；没图、或什么都没读出来，原样返回。"""
+    if not text or not VISION_ENABLED or not _has_image(data):
+        return text
+    note = await _group_image_note(data, uid, text)
+    if not note:
+        return text
+    return text + "\n\n" + note
+
+
 async def _voice_audio(seg: dict):
     """把一个 record（语音）段变成音频字节。
 
@@ -2924,6 +3705,38 @@ async def _transcribe_segments(segs) -> list[str]:
         if text:
             out.append(text)
             log(f"语音转文字：{text[:80]}")
+    return out
+
+
+def _has_record(data) -> bool:
+    """这条消息里有没有语音（结构化分段、CQ 码字符串两种形态都认）。"""
+    segs = data.get("message")
+    if isinstance(segs, list) and any(
+            isinstance(s, dict) and s.get("type") == "record" for s in segs):
+        return True
+    return "[CQ:record," in str(data.get("raw_message") or "")
+
+
+async def _group_voice_lines(data) -> list[str]:
+    """群里的语音 → 文字（本地识别，不发外部 API）。失败返回空列表。
+
+    和主人私聊那条路同一套逻辑。默认不要求 @（`voice.group_all`）；
+    "要不要接这句"是后面 handle_public / 攒批的事，不在这里判。
+    """
+    if not VOICE_ENABLED:
+        return []
+    segs = data.get("message")
+    out = await _transcribe_segments(segs)
+    if isinstance(segs, list) and any(
+            isinstance(s, dict) and s.get("type") == "record" for s in segs):
+        return out          # 结构化分段已经处理过，别再走 CQ 兜底（会转两遍）
+    for m in re.finditer(r"\[CQ:record,([^\]]+)\]", str(data.get("raw_message") or "")):
+        kv = dict(x.split("=", 1) for x in m.group(1).split(",") if "=" in x)
+        audio = await _voice_audio({"data": kv})
+        got = await asyncio.to_thread(VOICE.transcribe, audio) if audio else None
+        if got:
+            out.append(got)
+            log(f"群语音转文字（CQ 形式）：{got[:80]}")
     return out
 
 
@@ -3112,6 +3925,8 @@ async def on_message(data):
         await on_public_private(data, uid, raw)
         return
 
+    # 主人露面了：主动私聊从现在重新计时（命令也算——他在用机器就别打扰）
+    _proactive_touch()
     text = raw
     # 引用回复：QQ 会在正文前塞一个 [CQ:reply,id=...]。不剥掉的话模型会把它
     # 当成正文的一部分（实测它读成"带乱码的一句话"，完全没意识到那是在纠正
@@ -3142,6 +3957,9 @@ async def on_message(data):
     text = re.sub(r"\[CQ:(?:at|face|mface|reply|json|xml|record|video|file),"
                   r"[^\]]*\]", "", text).strip()
     imgs = await _save_images(data)
+    # 主人自己发的表情也收一份（他自己是最可能给它喂表情的人）
+    if imgs:
+        await _learn_stickers(data)
     # 有些 NapCat 配置把图片发成 CQ 码字符串（不是结构化分段），单独兜一层。
     # 同样只在结构化分段里没有图时才走：否则同一张图会被下载两次、在提示词里出现两遍。
     structured_img = (isinstance(_segs, list) and any(
@@ -3349,6 +4167,21 @@ async def main():
         logger.warning("public workdir create failed: %s", e)
     log(f"公开聊天：{'开启' if PUBLIC_ENABLED else '关闭'}"
         f"（每小时上限 {PUBLIC_MAX_PER_HOUR} 条，冷却 {PUBLIC_COOLDOWN:.0f}s）")
+    if GROUP_LEVEL is not None:
+        # 档位模式优先于 group_policy：没过档的消息根本不进模型，这是成本的第一道闸
+        log(f"群聊：档位模式 {GROUP_LEVEL}（{policy.LEVELS[GROUP_LEVEL]}）"
+            f" / 关键词 {GROUP_KEYWORDS or '无'} / 概率档 {GROUP_LEVEL_PROB:.2f}"
+            f" / 白名单 {len(GROUP_WHITELIST) or '不限'} 个群"
+            f" / 攒批{'开' if GROUP_BATCH_ENABLED else '关'}")
+    elif GROUP_POLICY == "active" and GROUP_BATCH_ENABLED:
+        log(f"群聊：攒批模式（没叫 等{GROUP_BATCH_IDLE_MS}ms / 叫到 等{GROUP_BATCH_CALLED_MS}ms"
+            f" / 最多攒{GROUP_BATCH_LINES}条 / 刚说完{GROUP_AFTER_SPEAK:.0f}s内攒够"
+            f"{GROUP_BATCH_OVERRIDE}条才开口 / 每小时最多{GROUP_BATCH_MAX_PER_HOUR}批）")
+    else:
+        log(f"群聊：策略={GROUP_POLICY}（攒批{'开' if GROUP_BATCH_ENABLED else '关'}）")
+    log(f"非主人私聊：{'全部可聊' if PUBLIC_PRIVATE else '默认不回'}"
+        f"（好友白名单 {len(FRIEND_WHITELIST)} 个）"
+        f" / 闲聊上下文 {DIRECT.history_turns} 轮、≤{DIRECT.history_max_chars} 字")
     # 上次崩溃/重启时还在跑的任务：标 interrupted 并准备通知
     rows = STORE.recover_interrupted()
     PENDING_NOTICES = [f"{r['id']} {r['text'][:60]}" for r in rows]
@@ -3364,6 +4197,14 @@ async def main():
         asyncio.create_task(worker(i))
     asyncio.create_task(janitor())
     asyncio.create_task(reminder_loop())
+    if _proactive_cfg().get("enabled"):
+        asyncio.create_task(proactive_loop())
+        _pc = _proactive_cfg()
+        log(f"主动私聊：开（静默 {_pc['idle_minutes']} 分钟起考虑，"
+            f"每天最多 {_pc['max_per_day']} 次，免打扰 {_pc['quiet_hours']}，"
+            f"巡检 {PROACTIVE_INTERVAL}s）")
+    else:
+        log("主动私聊：关着（config.json 的 proactive.enabled 或 /主动 关）")
     # 语音识别服务提前拉起来：模型加载/首次下载都要时间，等第一条语音再起就太晚了
     if VOICE_ENABLED:
         asyncio.create_task(asyncio.to_thread(VOICE.ensure_server))

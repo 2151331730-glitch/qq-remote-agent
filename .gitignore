@@ -15,6 +15,7 @@ bridge/memory.md
 # 聊天记录也是私人内容
 bridge/transcripts/
 bridge/state.json
+bridge/proactive_state.json
 bridge/*.bak-*
 tests/tmp/
 tools/*.log
@@ -55,3 +56,6 @@ bridge/asr-models/
 bridge/stickers/*
 !bridge/stickers/README.md
 model_state.json
+
+# 本地密钥目录（火山引擎等），永不入库
+secret/

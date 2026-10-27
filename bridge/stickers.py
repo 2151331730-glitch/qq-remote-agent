@@ -60,6 +60,51 @@ def clean_name(name, max_len: int = 12) -> str:
     return s[:max_len]
 
 
+def ext_of(blob: bytes) -> str:
+    """按文件头猜后缀。QQ 给的链接常常没有后缀，猜错会让客户端打不开。"""
+    head = bytes(blob[:12])
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def store(folder, name: str, blob: bytes) -> str:
+    """把一张表情图写进库，返回最终路径；写不进去（格式不认/重名）返回空串。
+
+    名字已经存在就跳过，不覆盖——别人的表情包同名是常事，覆盖等于丢一张。
+    """
+    ext = ext_of(blob)
+    if not ext or len(blob) < 200:
+        return ""
+    d = Path(folder)
+    d.mkdir(parents=True, exist_ok=True)
+    stem = clean_name(name) or "表情"
+    p = d / f"{stem}{ext}"
+    # 名字唯一是按**主干**算的：库里靠文件名找表情，狗头.gif 和 狗头.png
+    # 只能有一个能用（StickerBook 用 stem 当键），所以换了后缀也算重名。
+    same_stem = [q for q in d.iterdir() if q.stem == stem]
+    if not same_stem:
+        p.write_bytes(blob)
+        return str(p)
+    try:
+        if p.exists() and p.read_bytes() == blob:   # 同一张图，已经收过了
+            return str(p)
+    except Exception:
+        pass
+    for i in range(2, 6):                # 同名不同图：加序号，别覆盖
+        q = d / f"{stem}-{i}{ext}"
+        if not q.exists():
+            q.write_bytes(blob)
+            return str(q)
+    return ""
+
+
 def pick_save_source(paths, at: float, now: float, ttl: float = 120) -> str:
     """挑出"可以存成表情"的那张图；没有就返回空串。
 

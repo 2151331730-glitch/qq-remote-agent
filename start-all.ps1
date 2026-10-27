@@ -24,9 +24,18 @@ function Write-Log($msg) {
     Add-Content -Path $Log -Value $line -Encoding UTF8
 }
 
+function Get-BridgePid {
+    # bridge 自己的看板端口 3099。监听者的 PID 跨权限可读，是最干净的"桥在不在"信号。
+    $c = Get-NetTCPConnection -LocalPort 3099 -State Listen -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if ($c) { return $c.OwningProcess }
+    return 0
+}
+
 function Test-BridgeRunning {
-    # 管理员进程的命令行非管理员读不到，所以先看"有没有人连着 3001"（TCP 状态跨权限可读）。
-    if (Test-BridgeConnected) { return $true }
+    # 注意：不能只看"有没有人连着 3001"——tools\qq_mcp.py 也连着 3001，
+    # 桥死了它那条连接还在，会把这个判断骗成"桥活着"，于是永远不重启（2026-10-27 踩过）。
+    if (Get-BridgePid) { return $true }
     $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
              Where-Object { $_.CommandLine -like "*bridge.py*" }
     return [bool]$procs
@@ -37,8 +46,11 @@ function Test-OneBotListening {
 }
 
 function Test-BridgeConnected {
+    # 必须限定"是 bridge 这个进程"连的：qq_mcp 也连着 3001
+    $bp = Get-BridgePid
+    if (-not $bp) { return $false }
     return [bool](Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-                  Where-Object { $_.RemotePort -eq 3001 })
+                  Where-Object { $_.RemotePort -eq 3001 -and $_.OwningProcess -eq $bp })
 }
 
 function Start-Bridge {

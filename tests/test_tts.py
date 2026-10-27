@@ -61,7 +61,8 @@ def test_synth_too_short(tmp_path):
 
 
 def test_synth_falls_back_to_sapi(tmp_path, monkeypatch):
-    t = tts.TTS({"engine": "auto"}, cache_dir=tmp_path)
+    # 关掉火山：本机真有 secret/volc.json，不关就等于在测试里花钱调真接口
+    t = tts.TTS({"engine": "auto", "volc": {"enabled": False}}, cache_dir=tmp_path)
     monkeypatch.setattr(t, "_edge_importable", lambda: False)
     calls = []
 
@@ -79,7 +80,7 @@ def test_synth_falls_back_to_sapi(tmp_path, monkeypatch):
 
 
 def test_synth_edge_failure_falls_back(tmp_path, monkeypatch):
-    t = tts.TTS({"engine": "auto"}, cache_dir=tmp_path)
+    t = tts.TTS({"engine": "auto", "volc": {"enabled": False}}, cache_dir=tmp_path)
     monkeypatch.setattr(t, "_edge_importable", lambda: True)
 
     async def boom(text, out):

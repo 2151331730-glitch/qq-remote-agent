@@ -150,6 +150,14 @@ def _spy(b, monkeypatch):
 
     monkeypatch.setattr(b, "handle_public", fake_hp)
     monkeypatch.setattr(b, "GROUP_POLICY", "open")     # 否则 mention 压根不接别人
+    # 配置里有 group_level（默认 1）时，档位优先于 group_policy：
+    # 不过档就 return，下面这些「过闸后有没有交给 handle_public」的断言全部落空。
+    monkeypatch.setattr(b, "GROUP_LEVEL", None)
+    monkeypatch.setattr(b, "GROUP_LEVEL_OVERRIDES", {})
+    # 攒批关掉：这几条测的是「过闸之后有没有交给 handle_public」，
+    # 攒批开着的话消息会先落进缓冲区（那也是对的，但 spy 就看不到了）。
+    # 攒批本身有 tests/test_policy.py 里的独立用例。
+    monkeypatch.setattr(b, "GROUP_BATCH_ENABLED", False)
     b.PUBLIC_STATE["last"].clear()
     return calls
 
@@ -205,3 +213,102 @@ def test_group_text_raw_fallback(tmp_path, monkeypatch):
     assert b._group_text(data, SELF) == ("在吗", True, False)
     data = {"raw_message": "[CQ:at,qq=555] 在吗"}
     assert b._group_text(data, SELF) == ("在吗", False, True)
+
+
+# ---------------- 群语音：被 @ 时才转 ----------------
+
+def _voice_msg(at=None):
+    segs = [{"type": "at", "data": {"qq": str(qq)}} for qq in (at or [])]
+    segs.append({"type": "record", "data": {"file": "abc.amr"}})
+    return {"group_id": 7, "user_id": 42, "sender": {"nickname": "甲"}, "message": segs}
+
+
+def test_group_voice_is_transcribed_when_addressed(tmp_path, monkeypatch):
+    """被 @ 的语音要真的变成文字交下去 —— 以前这里只有「在呢」。"""
+    b = _load(tmp_path, monkeypatch)
+    calls = _spy(b, monkeypatch)
+
+    async def fake_audio(seg):
+        return b"fake-audio"
+
+    monkeypatch.setattr(b, "_voice_audio", fake_audio)
+    monkeypatch.setattr(b, "VOICE_ENABLED", True)
+    monkeypatch.setattr(b.VOICE, "transcribe", lambda audio: "今天下午三点开会")
+    asyncio.run(b.on_group_message(_voice_msg(at=[SELF]), SELF))
+    assert len(calls) == 1
+    assert "今天下午三点开会" in calls[0]["text"]
+    assert calls[0]["addressed"] is True
+
+
+def test_group_voice_transcribed_without_at(tmp_path, monkeypatch):
+    """没被 @ 的语音也要转：群聊靠攒批自己决定接不接，不能连内容都看不见。"""
+    b = _load(tmp_path, monkeypatch)
+    calls = _spy(b, monkeypatch)
+
+    async def fake_audio(seg):
+        return b"fake-audio"
+
+    monkeypatch.setattr(b, "_voice_audio", fake_audio)
+    monkeypatch.setattr(b, "VOICE_ENABLED", True)
+    monkeypatch.setattr(b, "GROUP_VOICE_ALL", True)   # 不依赖配置文件的默认值
+    monkeypatch.setattr(b.VOICE, "transcribe", lambda audio: "你们在聊什么呢")
+    asyncio.run(b.on_group_message(_voice_msg(), SELF))      # 不带 @
+    assert len(calls) == 1
+    assert "你们在聊什么呢" in calls[0]["text"]
+    assert calls[0]["addressed"] is False
+
+
+def test_group_voice_all_off_falls_back_to_addressed_only(tmp_path, monkeypatch):
+    """voice.group_all=false 时退回旧行为：只转被 @ 的，省 CPU。"""
+    b = _load(tmp_path, monkeypatch)
+    calls = _spy(b, monkeypatch)
+    called = []
+
+    async def fake_lines(data):
+        called.append(1)
+        return ["不该被转"]
+
+    monkeypatch.setattr(b, "_group_voice_lines", fake_lines)
+    monkeypatch.setattr(b, "GROUP_VOICE_ALL", False)
+    asyncio.run(b.on_group_message(_voice_msg(), SELF))      # 没被 @
+    assert called == []
+    assert calls == []
+
+
+def test_voice_at_someone_else_is_not_transcribed(tmp_path, monkeypatch):
+    """@ 别人的语音不转：后面本来也不接，转了是白耗 CPU。"""
+    b = _load(tmp_path, monkeypatch)
+    calls = _spy(b, monkeypatch)
+    called = []
+
+    async def fake_lines(data):
+        called.append(1)
+        return ["不该被转"]
+
+    monkeypatch.setattr(b, "_group_voice_lines", fake_lines)
+    monkeypatch.setattr(b, "GROUP_SKIP_AT_OTHER", True)
+    asyncio.run(b.on_group_message(_voice_msg(at=[555]), SELF))
+    assert called == []
+    assert calls == []
+
+
+def test_group_voice_failure_gives_placeholder(tmp_path, monkeypatch):
+    """拿不到音频 / 转不出来时给占位，别让模型以为对方发了条空消息。"""
+    b = _load(tmp_path, monkeypatch)
+    calls = _spy(b, monkeypatch)
+
+    async def no_audio(seg):
+        return None
+
+    monkeypatch.setattr(b, "_voice_audio", no_audio)
+    monkeypatch.setattr(b, "VOICE_ENABLED", True)
+    asyncio.run(b.on_group_message(_voice_msg(at=[SELF]), SELF))
+    assert len(calls) == 1
+    assert "没能转成文字" in calls[0]["text"]
+
+
+def test_has_record_recognises_both_shapes(tmp_path, monkeypatch):
+    b = _load(tmp_path, monkeypatch)
+    assert b._has_record(_voice_msg(at=[SELF])) is True
+    assert b._has_record({"raw_message": "[CQ:record,file=x.amr]"}) is True
+    assert b._has_record(_msg("纯文字")) is False
